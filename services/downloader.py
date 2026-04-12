@@ -1,0 +1,199 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import yt_dlp
+
+from platforms import Platform, detect_platform
+from platforms import instagram as ig_mod
+from platforms import tiktok as tt_mod
+from platforms import twitter as tw_mod
+from utils.config import Settings
+from utils.urltools import normalize_http_url
+
+logger = logging.getLogger(__name__)
+
+
+class DownloadError(Exception):
+    pass
+
+
+@dataclass
+class DownloadResult:
+    path: Path | None
+    title: str | None
+    direct_urls: list[str]
+    platform: Platform
+
+
+def _merge_dict(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
+    out = dict(a)
+    for k, v in b.items():
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = _merge_dict(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def _base_opts(out_dir: Path, out_stem: str, settings: Settings) -> dict[str, Any]:
+    opts: dict[str, Any] = {
+        "outtmpl": str(out_dir / f"{out_stem}.%(ext)s"),
+        "merge_output_format": "mp4",
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": False,
+        "retries": 3,
+        "fragment_retries": 3,
+        "socket_timeout": 120,
+        "http_chunk_size": 10 * 1024 * 1024,
+    }
+    if settings.cookies_file and settings.cookies_file.is_file():
+        opts["cookiefile"] = str(settings.cookies_file)
+    return opts
+
+
+def _platform_opts(platform: Platform) -> dict[str, Any]:
+    if platform is Platform.INSTAGRAM:
+        return ig_mod.ytdlp_overrides()
+    if platform is Platform.TIKTOK:
+        return tt_mod.ytdlp_overrides()
+    if platform is Platform.TWITTER:
+        return tw_mod.ytdlp_overrides()
+    return {}
+
+
+def _build_ydl_opts(
+    url: str,
+    out_dir: Path,
+    out_stem: str,
+    settings: Settings,
+) -> tuple[dict[str, Any], Platform]:
+    platform = detect_platform(url)
+    merged = _base_opts(out_dir, out_stem, settings)
+    merged = _merge_dict(merged, _platform_opts(platform))
+    return merged, platform
+
+
+def _extract_direct_urls(url: str, settings: Settings) -> list[str]:
+    opts: dict[str, Any] = {
+        "quiet": True,
+        "skip_download": True,
+        "forcejson": True,
+        "noplaylist": True,
+    }
+    if settings.cookies_file and settings.cookies_file.is_file():
+        opts["cookiefile"] = str(settings.cookies_file)
+    urls: list[str] = []
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if not info:
+                return []
+            if "url" in info and info["url"]:
+                urls.append(str(info["url"]))
+            for f in info.get("formats") or []:
+                u = f.get("url")
+                if u and u not in urls:
+                    urls.append(str(u))
+    except Exception as e:
+        logger.info("Could not list direct URLs: %s", e)
+    return urls[:5]
+
+
+def _download_sync(url: str, ydl_opts: dict[str, Any]) -> tuple[Path | None, str | None]:
+    last_path: Path | None = None
+    title: str | None = None
+
+    def hook(d: dict[str, Any]) -> None:
+        nonlocal last_path
+        if d.get("status") == "finished":
+            fp = d.get("filename")
+            if fp:
+                last_path = Path(fp)
+
+    opts = dict(ydl_opts)
+    opts["progress_hooks"] = [hook]
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if info:
+            title = info.get("title") or info.get("id")
+            fn = ydl.prepare_filename(info)
+            candidate = Path(fn)
+            if candidate.is_file():
+                last_path = candidate
+            elif "requested_downloads" in info:
+                for part in info["requested_downloads"]:
+                    p = part.get("filepath")
+                    if p and Path(p).is_file():
+                        last_path = Path(p)
+                        break
+
+    return last_path, title
+
+
+async def download_media(url: str, settings: Settings) -> DownloadResult:
+    url = normalize_http_url(url)
+    platform = detect_platform(url)
+    if platform is Platform.UNKNOWN:
+        raise DownloadError(
+            "Unsupported URL. Send a link from Instagram, TikTok, or X (Twitter)."
+        )
+
+    out_dir = settings.temp_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_stem = f"{uuid.uuid4().hex}"
+    ydl_opts, _ = _build_ydl_opts(url, out_dir, out_stem, settings)
+
+    logger.info("Downloading url=%s platform=%s", url, platform.value)
+
+    path: Path | None = None
+    title: str | None = None
+    for attempt in range(2):
+        try:
+            path, title = await asyncio.to_thread(_download_sync, url, ydl_opts)
+            break
+        except yt_dlp.utils.DownloadError as e:
+            if attempt == 0:
+                logger.warning("Download retry after error: %s", e)
+                await asyncio.sleep(2)
+                continue
+            msg = str(e).lower()
+            if "private" in msg or "login" in msg or "cookies" in msg:
+                raise DownloadError(
+                    "This content is private or requires login. "
+                    "For Instagram, add a cookies file (see COOKIES_FILE in .env)."
+                ) from e
+            if "unavailable" in msg or "not available" in msg:
+                raise DownloadError("Video is unavailable or the link is invalid.") from e
+            raise DownloadError(f"Download failed: {e}") from e
+        except Exception as e:
+            if attempt == 0:
+                logger.warning("Download retry after error: %s", e)
+                await asyncio.sleep(2)
+                continue
+            logger.exception("Download error")
+            raise DownloadError(f"Download failed: {e}") from e
+
+    direct_urls = _extract_direct_urls(url, settings)
+
+    if not path or not path.is_file():
+        return DownloadResult(
+            path=None,
+            title=title,
+            direct_urls=direct_urls,
+            platform=platform,
+        )
+
+    return DownloadResult(
+        path=path,
+        title=title,
+        direct_urls=direct_urls,
+        platform=platform,
+    )
