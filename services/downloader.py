@@ -18,9 +18,54 @@ from utils.urltools import normalize_http_url
 
 logger = logging.getLogger(__name__)
 
+_IG_HELP_NO_COOKIES = (
+    "Public reels often fail from cloud/datacenter IPs until Instagram sees a real browser session. "
+    "Export a Netscape cookies.txt while logged in at instagram.com and set COOKIES_FILE "
+    "(e.g. in Render → Environment)."
+)
+_IG_HELP_HAS_COOKIES = (
+    " COOKIES_FILE is set — cookies may be expired or invalid; re-export from your browser."
+)
+
 
 class DownloadError(Exception):
     pass
+
+
+def _map_download_failure(platform: Platform, err: Exception, settings: Settings) -> None:
+    """Raise DownloadError with a user-facing message; logs full yt-dlp output."""
+    raw = str(err)
+    msg = raw.lower()
+    logger.info("yt-dlp error: %s", raw[:1200])
+
+    if any(
+        x in msg
+        for x in (
+            "unavailable",
+            "not available",
+            "deleted",
+            "removed",
+            "does not exist",
+        )
+    ):
+        raise DownloadError("This video is unavailable or the link is invalid.") from err
+
+    if platform is Platform.INSTAGRAM:
+        if "unsupported url" in msg:
+            raise DownloadError(f"Unsupported URL: {raw[:280]}") from err
+        has = bool(settings.cookies_file and settings.cookies_file.is_file())
+        raise DownloadError(
+            "Instagram did not return this video to the server. "
+            + (_IG_HELP_HAS_COOKIES if has else _IG_HELP_NO_COOKIES)
+        ) from err
+
+    if "private" in msg or "login" in msg or "cookies" in msg:
+        raise DownloadError(
+            "This content is private or requires login. "
+            "If the site is Instagram, add COOKIES_FILE with a browser cookies export."
+        ) from err
+
+    raise DownloadError(f"Download failed: {raw[:500]}") from err
 
 
 @dataclass
@@ -164,22 +209,14 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
                 logger.warning("Download retry after error: %s", e)
                 await asyncio.sleep(2)
                 continue
-            msg = str(e).lower()
-            if "private" in msg or "login" in msg or "cookies" in msg:
-                raise DownloadError(
-                    "This content is private or requires login. "
-                    "For Instagram, add a cookies file (see COOKIES_FILE in .env)."
-                ) from e
-            if "unavailable" in msg or "not available" in msg:
-                raise DownloadError("Video is unavailable or the link is invalid.") from e
-            raise DownloadError(f"Download failed: {e}") from e
+            _map_download_failure(platform, e, settings)
         except Exception as e:
             if attempt == 0:
                 logger.warning("Download retry after error: %s", e)
                 await asyncio.sleep(2)
                 continue
             logger.exception("Download error")
-            raise DownloadError(f"Download failed: {e}") from e
+            _map_download_failure(platform, e, settings)
 
     direct_urls = _extract_direct_urls(url, settings)
 
