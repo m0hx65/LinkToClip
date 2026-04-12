@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from aiohttp.web_runner import AppRunner
+
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from bot.handlers.download import router as download_router
+from bot.health_server import start_if_configured
 from bot.middlewares import SettingsMiddleware
 from utils.config import load_settings
 from utils.logging_setup import setup_logging
@@ -30,7 +33,12 @@ async def main() -> None:
     dp.include_router(download_router)
 
     logger.info("Bot starting")
-    await dp.start_polling(bot)
+    http_runner: AppRunner | None = await start_if_configured()
+    try:
+        await dp.start_polling(bot)
+    finally:
+        if http_runner is not None:
+            await http_runner.cleanup()
 
 
 if __name__ == "__main__":
