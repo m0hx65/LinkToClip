@@ -1,0 +1,11 @@
+# Render Blueprint: Background Worker (not a web service)
+services:
+  - type: worker
+    name: social-video-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: LOG_LEVEL
+        value: INFO
