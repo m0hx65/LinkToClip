@@ -24,7 +24,7 @@ _URL_RE = re.compile(
     re.I,
 )
 _BARE_HOST = re.compile(
-    r"\b(?:instagram|tiktok|twitter|x)\.com/[^\s<>\"]+",
+    r"\b(?:instagram|tiktok|twitter|x|youtube)\.com/[^\s<>\"]+|\byoutu\.be/[^\s<>\"]+",
     re.I,
 )
 
@@ -53,7 +53,7 @@ async def _safe_unlink(path: Path | None) -> None:
 async def cmd_start(message: Message) -> None:
     await message.answer(
         "Send a video link from <b>Instagram</b> (reel/story/post), <b>TikTok</b>, "
-        "or <b>X/Twitter</b>.\nI'll download and send the video here."
+        "<b>X/Twitter</b>, or <b>YouTube</b>.\nI'll download and send the video here."
     )
 
 

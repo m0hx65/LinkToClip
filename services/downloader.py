@@ -13,6 +13,7 @@ from platforms import Platform, detect_platform
 from platforms import instagram as ig_mod
 from platforms import tiktok as tt_mod
 from platforms import twitter as tw_mod
+from platforms import youtube as yt_mod
 from utils.config import Settings
 from utils.urltools import normalize_http_url
 
@@ -110,6 +111,8 @@ def _platform_opts(platform: Platform) -> dict[str, Any]:
         return tt_mod.ytdlp_overrides()
     if platform is Platform.TWITTER:
         return tw_mod.ytdlp_overrides()
+    if platform is Platform.YOUTUBE:
+        return yt_mod.ytdlp_overrides()
     return {}
 
 
@@ -188,7 +191,7 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
     platform = detect_platform(url)
     if platform is Platform.UNKNOWN:
         raise DownloadError(
-            "Unsupported URL. Send a link from Instagram, TikTok, or X (Twitter)."
+            "Unsupported URL. Send a link from Instagram, TikTok, X (Twitter), or YouTube."
         )
 
     out_dir = settings.temp_dir

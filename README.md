@@ -1,6 +1,6 @@
 # Social video Telegram bot
 
-Async Telegram bot (aiogram 3 + yt-dlp) that downloads videos from Instagram, TikTok, and X/Twitter and sends them in chat. Files over the Bot API limit are re-encoded with **ffmpeg** when possible, otherwise direct download links are returned.
+Async Telegram bot (aiogram 3 + yt-dlp) that downloads videos from Instagram, TikTok, X/Twitter, and YouTube and sends them in chat. Files over the Bot API limit are re-encoded with **ffmpeg** when possible, otherwise direct download links are returned.
 
 ## Prerequisites
 
