@@ -203,37 +203,40 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
 
     path: Path | None = None
     title: str | None = None
-    for attempt in range(2):
+    attempts = 1 if platform is Platform.INSTAGRAM else 2
+    for attempt in range(attempts):
         try:
             path, title = await asyncio.to_thread(_download_sync, url, ydl_opts)
             break
         except yt_dlp.utils.DownloadError as e:
-            if attempt == 0:
+            if attempt < attempts - 1:
                 logger.warning("Download retry after error: %s", e)
                 await asyncio.sleep(2)
                 continue
             _map_download_failure(platform, e, settings)
         except Exception as e:
-            if attempt == 0:
+            if attempt < attempts - 1:
                 logger.warning("Download retry after error: %s", e)
                 await asyncio.sleep(2)
                 continue
             logger.exception("Download error")
             _map_download_failure(platform, e, settings)
 
-    direct_urls = _extract_direct_urls(url, settings)
-
     if not path or not path.is_file():
         return DownloadResult(
             path=None,
             title=title,
-            direct_urls=direct_urls,
+            direct_urls=[],
             platform=platform,
         )
 
     return DownloadResult(
         path=path,
         title=title,
-        direct_urls=direct_urls,
+        direct_urls=[],
         platform=platform,
     )
+
+
+async def get_direct_urls(url: str, settings: Settings) -> list[str]:
+    return await asyncio.to_thread(_extract_direct_urls, normalize_http_url(url), settings)

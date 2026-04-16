@@ -16,7 +16,16 @@ class Settings:
     temp_dir: Path
     telegram_max_file_bytes: int
     compress_target_bytes: int
+    enable_compression: bool
     cookies_file: Path | None
+    max_concurrent_downloads: int
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def load_settings() -> Settings:
@@ -40,5 +49,7 @@ def load_settings() -> Settings:
         compress_target_bytes=int(
             os.getenv("COMPRESS_TARGET_BYTES", str(46 * 1024 * 1024))
         ),
+        enable_compression=_env_bool("ENABLE_COMPRESSION", False),
         cookies_file=cookies_path,
+        max_concurrent_downloads=max(int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "1")), 1),
     )

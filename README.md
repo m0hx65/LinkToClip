@@ -46,6 +46,8 @@ Async Telegram bot (aiogram 3 + yt-dlp) that downloads videos from Instagram, Ti
 | `TEMP_DIR` | No | Download directory (default `./data/temp`) |
 | `TELEGRAM_MAX_FILE_BYTES` | No | Max size to upload (~49MB default) |
 | `COMPRESS_TARGET_BYTES` | No | Target size when re-encoding |
+| `ENABLE_COMPRESSION` | No | `false` by default to reduce RAM usage on small instances; set `true` to try ffmpeg shrink for oversized files |
+| `MAX_CONCURRENT_DOWNLOADS` | No | Parallel download jobs (default `1`; keep at `1` for low-memory hosts) |
 | `COOKIES_FILE` | No | Netscape `cookies.txt` from a browser session on **instagram.com** — often needed on **cloud hosts** even for **public** reels (Instagram blocks datacenter IPs without a session) |
 
 ## Deployment
