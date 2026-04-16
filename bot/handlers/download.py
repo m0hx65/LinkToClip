@@ -9,7 +9,8 @@ from aiogram.enums import ChatAction
 from aiogram.types import FSInputFile, Message
 from aiogram.filters import Command, CommandStart
 
-from services.compressor import compress_video
+from platforms import Platform
+from services.compressor import compress_video, make_ios_compatible
 from services.downloader import DownloadError, download_media
 from utils.config import Settings
 from utils.messaging import edit_or_replace_status
@@ -76,6 +77,7 @@ async def on_text(
 
     work_path: Path | None = None
     compressed_path: Path | None = None
+    ios_path: Path | None = None
 
     try:
         result = await download_media(url, settings)
@@ -100,6 +102,14 @@ async def on_text(
             size,
             result.title,
         )
+
+        if result.platform is Platform.INSTAGRAM:
+            ios_path = work_path.with_name(work_path.stem + "_ios.mp4")
+            ios_ok = await make_ios_compatible(work_path, ios_path)
+            if ios_ok and ios_path.is_file():
+                work_path = ios_path
+                size = work_path.stat().st_size
+                logger.info("Instagram video normalized for iOS playback; size=%s", size)
 
         send_path = work_path
         if size > settings.telegram_max_file_bytes:
@@ -151,6 +161,7 @@ async def on_text(
         await edit_or_replace_status(status, "Something went wrong. Please try again later.")
     finally:
         await _safe_unlink(compressed_path)
+        await _safe_unlink(ios_path)
         # Keep original for debugging or delete — delete to save disk
         if compressed_path and compressed_path != work_path:
             pass

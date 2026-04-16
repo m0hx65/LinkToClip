@@ -90,3 +90,47 @@ async def compress_video(
         logger.error("ffmpeg not found on PATH")
         return False
     return await asyncio.to_thread(_run_ffmpeg_sync, input_path, output_path, target_bytes)
+
+
+def _run_ios_compatible_sync(input_path: Path, output_path: Path) -> bool:
+    """
+    Re-encode to a broadly compatible MP4 profile for iOS players.
+    """
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-profile:v",
+        "high",
+        "-level",
+        "4.1",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-movflags",
+        "+faststart",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        str(output_path),
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        return output_path.is_file() and output_path.stat().st_size > 0
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        logger.warning("ffmpeg iOS-compatible transcode failed: %s", e)
+        return False
+
+
+async def make_ios_compatible(input_path: Path, output_path: Path) -> bool:
+    if not await ffmpeg_available():
+        logger.error("ffmpeg not found on PATH")
+        return False
+    return await asyncio.to_thread(_run_ios_compatible_sync, input_path, output_path)
