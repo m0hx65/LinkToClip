@@ -33,9 +33,31 @@ _IG_HELP_HAS_COOKIES = (
     " COOKIES_FILE is set — cookies may be expired or invalid; re-export from your browser."
 )
 
+_TW_HELP_NO_COOKIES = (
+    "X often omits video from unauthenticated API responses (including multi-video posts). "
+    "Export a Netscape cookies.txt while logged in at x.com (include auth_token and ct0) and set "
+    "TWITTER_COOKIES_FILE, or add those domains to COOKIES_FILE."
+)
+_TW_HELP_HAS_COOKIES = (
+    " Cookies are set but X still returned no video — the tweet may be restricted, "
+    "or cookies expired; re-export from your browser."
+)
+
 
 class DownloadError(Exception):
     pass
+
+
+def _cookiefile_for_platform(settings: Settings, platform: Platform) -> str | None:
+    if platform is Platform.TWITTER:
+        if settings.twitter_cookies_file and settings.twitter_cookies_file.is_file():
+            return str(settings.twitter_cookies_file)
+        if settings.cookies_file and settings.cookies_file.is_file():
+            return str(settings.cookies_file)
+        return None
+    if settings.cookies_file and settings.cookies_file.is_file():
+        return str(settings.cookies_file)
+    return None
 
 
 def _map_download_failure(platform: Platform, err: Exception, settings: Settings) -> None:
@@ -65,6 +87,12 @@ def _map_download_failure(platform: Platform, err: Exception, settings: Settings
             + (_IG_HELP_HAS_COOKIES if has else _IG_HELP_NO_COOKIES)
         ) from err
 
+    if platform is Platform.TWITTER and "no video could be found in this tweet" in msg:
+        has = bool(_cookiefile_for_platform(settings, Platform.TWITTER))
+        raise DownloadError(
+            "Could not get video from this X post. " + (_TW_HELP_HAS_COOKIES if has else _TW_HELP_NO_COOKIES)
+        ) from err
+
     if "private" in msg or "login" in msg or "cookies" in msg:
         raise DownloadError(
             "This content is private or requires login. "
@@ -92,7 +120,7 @@ def _merge_dict(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _base_opts(out_dir: Path, out_stem: str, settings: Settings) -> dict[str, Any]:
+def _base_opts(out_dir: Path, out_stem: str, settings: Settings, platform: Platform) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "outtmpl": str(out_dir / f"{out_stem}.%(ext)s"),
         "merge_output_format": "mp4",
@@ -104,8 +132,9 @@ def _base_opts(out_dir: Path, out_stem: str, settings: Settings) -> dict[str, An
         "socket_timeout": 120,
         "http_chunk_size": 10 * 1024 * 1024,
     }
-    if settings.cookies_file and settings.cookies_file.is_file():
-        opts["cookiefile"] = str(settings.cookies_file)
+    cf = _cookiefile_for_platform(settings, platform)
+    if cf:
+        opts["cookiefile"] = cf
     return opts
 
 
@@ -128,7 +157,7 @@ def _build_ydl_opts(
     settings: Settings,
 ) -> tuple[dict[str, Any], Platform]:
     platform = detect_platform(url)
-    merged = _base_opts(out_dir, out_stem, settings)
+    merged = _base_opts(out_dir, out_stem, settings, platform)
     merged = _merge_dict(merged, _platform_opts(platform))
     return merged, platform
 
@@ -154,8 +183,10 @@ def _extract_direct_urls(url: str, settings: Settings) -> list[str]:
         "forcejson": True,
         "noplaylist": True,
     }
-    if settings.cookies_file and settings.cookies_file.is_file():
-        opts["cookiefile"] = str(settings.cookies_file)
+    platform = detect_platform(url)
+    cf = _cookiefile_for_platform(settings, platform)
+    if cf:
+        opts["cookiefile"] = cf
     urls: list[str] = []
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:

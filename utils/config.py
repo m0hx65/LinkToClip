@@ -18,6 +18,7 @@ class Settings:
     compress_target_bytes: int
     enable_compression: bool
     cookies_file: Path | None
+    twitter_cookies_file: Path | None
     max_concurrent_downloads: int
 
 
@@ -38,6 +39,8 @@ def load_settings() -> Settings:
 
     cookies = os.getenv("COOKIES_FILE", "").strip()
     cookies_path = Path(cookies) if cookies else None
+    tw_cookies = os.getenv("TWITTER_COOKIES_FILE", "").strip()
+    twitter_cookies_path = Path(tw_cookies) if tw_cookies else None
 
     return Settings(
         bot_token=token,
@@ -51,5 +54,6 @@ def load_settings() -> Settings:
         ),
         enable_compression=_env_bool("ENABLE_COMPRESSION", False),
         cookies_file=cookies_path,
+        twitter_cookies_file=twitter_cookies_path,
         max_concurrent_downloads=max(int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "1")), 1),
     )
