@@ -38,6 +38,22 @@ class DownloadError(Exception):
     pass
 
 
+class _YtdlpLogger:
+    """Route yt-dlp console output into our logger (avoids raw ERROR: lines on stderr)."""
+
+    def debug(self, msg: str) -> None:
+        logger.debug("yt-dlp: %s", msg.rstrip())
+
+    def info(self, msg: str) -> None:
+        logger.debug("yt-dlp: %s", msg.rstrip())
+
+    def warning(self, msg: str) -> None:
+        logger.info("yt-dlp: %s", msg.rstrip())
+
+    def error(self, msg: str) -> None:
+        logger.info("yt-dlp: %s", msg.rstrip())
+
+
 def _cookiefile_for_platform(settings: Settings, platform: Platform) -> str | None:
     # X/Twitter: guest-only (no cookiefile). yt-dlp uses GraphQL + syndication fallbacks below.
     if platform is Platform.TWITTER:
@@ -112,6 +128,7 @@ def _base_opts(out_dir: Path, out_stem: str, settings: Settings, platform: Platf
         "outtmpl": str(out_dir / f"{out_stem}.%(ext)s"),
         "merge_output_format": "mp4",
         "noplaylist": True,
+        "noprogress": True,
         "quiet": True,
         "no_warnings": False,
         "retries": 3,
@@ -163,13 +180,13 @@ def _twitter_candidate_urls(url: str) -> list[str]:
     ]
 
 
-def _twitter_ydl_opts_variants(ydl_opts: dict[str, Any]) -> list[dict[str, Any]]:
+def _twitter_ydl_opts_variants(ydl_opts: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     """Guest-only strategies: default GraphQL, then syndication API."""
     synd = _merge_dict(
         ydl_opts,
         {"extractor_args": {"twitter": {"api": ["syndication"]}}},
     )
-    return [ydl_opts, synd]
+    return [("graphql", ydl_opts), ("syndication", synd)]
 
 
 def _extract_direct_urls(url: str, settings: Settings) -> list[str]:
@@ -221,6 +238,8 @@ def _download_sync(url: str, ydl_opts: dict[str, Any]) -> tuple[Path | None, str
 
     opts = dict(ydl_opts)
     opts["progress_hooks"] = [hook]
+    opts.setdefault("logger", _YtdlpLogger())
+    opts.setdefault("noprogress", True)
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -255,11 +274,10 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
     candidate_urls = (
         _twitter_candidate_urls(url) if platform is Platform.TWITTER else [url]
     )
-    opts_variants = (
-        _twitter_ydl_opts_variants(ydl_opts)
-        if platform is Platform.TWITTER
-        else [ydl_opts]
-    )
+    if platform is Platform.TWITTER:
+        opts_variants = _twitter_ydl_opts_variants(ydl_opts)
+    else:
+        opts_variants = [("default", ydl_opts)]
 
     logger.info("Downloading url=%s platform=%s", url, platform.value)
 
@@ -267,7 +285,9 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
     title: str | None = None
     attempts = 1 if platform is Platform.INSTAGRAM else 2
     last_err: Exception | None = None
-    for opt_variant in opts_variants:
+    for strategy_name, opt_variant in opts_variants:
+        if platform is Platform.TWITTER:
+            logger.info("Twitter yt-dlp strategy=%s", strategy_name)
         for candidate in candidate_urls:
             for attempt in range(attempts):
                 try:

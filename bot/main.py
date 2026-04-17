@@ -33,6 +33,11 @@ async def main() -> None:
     dp.include_router(download_router)
 
     logger.info("Bot starting")
+    logger.info(
+        "Using long polling (getUpdates). Run only one process with this BOT_TOKEN — e.g. stop a "
+        "local run if the bot is deployed on Render, or scale duplicate workers to one. "
+        "TelegramConflictError means another instance is still polling."
+    )
     http_runner: AppRunner | None = await start_if_configured()
     try:
         await dp.start_polling(bot)
