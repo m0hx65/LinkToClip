@@ -33,27 +33,14 @@ _IG_HELP_HAS_COOKIES = (
     " COOKIES_FILE is set — cookies may be expired or invalid; re-export from your browser."
 )
 
-_TW_HELP_NO_COOKIES = (
-    "X often omits video from unauthenticated API responses (including multi-video posts). "
-    "Export a Netscape cookies.txt while logged in at x.com (include auth_token and ct0) and set "
-    "TWITTER_COOKIES_FILE, or add those domains to COOKIES_FILE."
-)
-_TW_HELP_HAS_COOKIES = (
-    " Cookies are set but X still returned no video — the tweet may be restricted, "
-    "or cookies expired; re-export from your browser."
-)
-
 
 class DownloadError(Exception):
     pass
 
 
 def _cookiefile_for_platform(settings: Settings, platform: Platform) -> str | None:
+    # X/Twitter: guest-only (no cookiefile). yt-dlp uses GraphQL + syndication fallbacks below.
     if platform is Platform.TWITTER:
-        if settings.twitter_cookies_file and settings.twitter_cookies_file.is_file():
-            return str(settings.twitter_cookies_file)
-        if settings.cookies_file and settings.cookies_file.is_file():
-            return str(settings.cookies_file)
         return None
     if settings.cookies_file and settings.cookies_file.is_file():
         return str(settings.cookies_file)
@@ -88,9 +75,9 @@ def _map_download_failure(platform: Platform, err: Exception, settings: Settings
         ) from err
 
     if platform is Platform.TWITTER and "no video could be found in this tweet" in msg:
-        has = bool(_cookiefile_for_platform(settings, Platform.TWITTER))
         raise DownloadError(
-            "Could not get video from this X post. " + (_TW_HELP_HAS_COOKIES if has else _TW_HELP_NO_COOKIES)
+            "Could not get a video from this X link. The post may have no video, or X did not "
+            "expose embeddable media to automated access (common for some threads or clips)."
         ) from err
 
     if "private" in msg or "login" in msg or "cookies" in msg:
@@ -176,6 +163,15 @@ def _twitter_candidate_urls(url: str) -> list[str]:
     ]
 
 
+def _twitter_ydl_opts_variants(ydl_opts: dict[str, Any]) -> list[dict[str, Any]]:
+    """Guest-only strategies: default GraphQL, then syndication API."""
+    synd = _merge_dict(
+        ydl_opts,
+        {"extractor_args": {"twitter": {"api": ["syndication"]}}},
+    )
+    return [ydl_opts, synd]
+
+
 def _extract_direct_urls(url: str, settings: Settings) -> list[str]:
     opts: dict[str, Any] = {
         "quiet": True,
@@ -259,6 +255,11 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
     candidate_urls = (
         _twitter_candidate_urls(url) if platform is Platform.TWITTER else [url]
     )
+    opts_variants = (
+        _twitter_ydl_opts_variants(ydl_opts)
+        if platform is Platform.TWITTER
+        else [ydl_opts]
+    )
 
     logger.info("Downloading url=%s platform=%s", url, platform.value)
 
@@ -266,25 +267,28 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
     title: str | None = None
     attempts = 1 if platform is Platform.INSTAGRAM else 2
     last_err: Exception | None = None
-    for candidate in candidate_urls:
-        for attempt in range(attempts):
-            try:
-                path, title = await asyncio.to_thread(_download_sync, candidate, ydl_opts)
+    for opt_variant in opts_variants:
+        for candidate in candidate_urls:
+            for attempt in range(attempts):
+                try:
+                    path, title = await asyncio.to_thread(_download_sync, candidate, opt_variant)
+                    break
+                except yt_dlp.utils.DownloadError as e:
+                    last_err = e
+                    if attempt < attempts - 1:
+                        logger.warning("Download retry after error: %s", e)
+                        await asyncio.sleep(2)
+                        continue
+                    logger.info("Download failed for candidate url=%s err=%s", candidate, e)
+                except Exception as e:
+                    last_err = e
+                    if attempt < attempts - 1:
+                        logger.warning("Download retry after error: %s", e)
+                        await asyncio.sleep(2)
+                        continue
+                    logger.info("Download failed for candidate url=%s err=%s", candidate, e)
+            if path and path.is_file():
                 break
-            except yt_dlp.utils.DownloadError as e:
-                last_err = e
-                if attempt < attempts - 1:
-                    logger.warning("Download retry after error: %s", e)
-                    await asyncio.sleep(2)
-                    continue
-                logger.info("Download failed for candidate url=%s err=%s", candidate, e)
-            except Exception as e:
-                last_err = e
-                if attempt < attempts - 1:
-                    logger.warning("Download retry after error: %s", e)
-                    await asyncio.sleep(2)
-                    continue
-                logger.info("Download failed for candidate url=%s err=%s", candidate, e)
         if path and path.is_file():
             break
 
