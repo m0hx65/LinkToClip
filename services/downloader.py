@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,10 @@ from utils.config import Settings
 from utils.urltools import normalize_http_url
 
 logger = logging.getLogger(__name__)
+_TW_I_STATUS_RE = re.compile(
+    r"^(https?://)(?:www\.)?(?:x\.com|twitter\.com)/i/status/(\d+)(?:[/?#].*)?$",
+    re.I,
+)
 
 _IG_HELP_NO_COOKIES = (
     "Public reels often fail from cloud/datacenter IPs until Instagram sees a real browser session. "
@@ -128,6 +133,20 @@ def _build_ydl_opts(
     return merged, platform
 
 
+def _twitter_candidate_urls(url: str) -> list[str]:
+    """Generate equivalent tweet URLs for extractor edge-cases."""
+    m = _TW_I_STATUS_RE.match(url.strip())
+    if not m:
+        return [url]
+    tweet_id = m.group(2)
+    return [
+        url,
+        f"https://x.com/i/web/status/{tweet_id}",
+        f"https://twitter.com/i/web/status/{tweet_id}",
+        f"https://twitter.com/i/status/{tweet_id}",
+    ]
+
+
 def _extract_direct_urls(url: str, settings: Settings) -> list[str]:
     opts: dict[str, Any] = {
         "quiet": True,
@@ -145,6 +164,14 @@ def _extract_direct_urls(url: str, settings: Settings) -> list[str]:
                 return []
             if "url" in info and info["url"]:
                 urls.append(str(info["url"]))
+            for entry in info.get("entries") or []:
+                eu = entry.get("url")
+                if eu and eu not in urls:
+                    urls.append(str(eu))
+                for f in entry.get("formats") or []:
+                    u = f.get("url")
+                    if u and u not in urls:
+                        urls.append(str(u))
             for f in info.get("formats") or []:
                 u = f.get("url")
                 if u and u not in urls:
@@ -198,31 +225,41 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
     out_dir.mkdir(parents=True, exist_ok=True)
     out_stem = f"{uuid.uuid4().hex}"
     ydl_opts, _ = _build_ydl_opts(url, out_dir, out_stem, settings)
+    candidate_urls = (
+        _twitter_candidate_urls(url) if platform is Platform.TWITTER else [url]
+    )
 
     logger.info("Downloading url=%s platform=%s", url, platform.value)
 
     path: Path | None = None
     title: str | None = None
     attempts = 1 if platform is Platform.INSTAGRAM else 2
-    for attempt in range(attempts):
-        try:
-            path, title = await asyncio.to_thread(_download_sync, url, ydl_opts)
+    last_err: Exception | None = None
+    for candidate in candidate_urls:
+        for attempt in range(attempts):
+            try:
+                path, title = await asyncio.to_thread(_download_sync, candidate, ydl_opts)
+                break
+            except yt_dlp.utils.DownloadError as e:
+                last_err = e
+                if attempt < attempts - 1:
+                    logger.warning("Download retry after error: %s", e)
+                    await asyncio.sleep(2)
+                    continue
+                logger.info("Download failed for candidate url=%s err=%s", candidate, e)
+            except Exception as e:
+                last_err = e
+                if attempt < attempts - 1:
+                    logger.warning("Download retry after error: %s", e)
+                    await asyncio.sleep(2)
+                    continue
+                logger.info("Download failed for candidate url=%s err=%s", candidate, e)
+        if path and path.is_file():
             break
-        except yt_dlp.utils.DownloadError as e:
-            if attempt < attempts - 1:
-                logger.warning("Download retry after error: %s", e)
-                await asyncio.sleep(2)
-                continue
-            _map_download_failure(platform, e, settings)
-        except Exception as e:
-            if attempt < attempts - 1:
-                logger.warning("Download retry after error: %s", e)
-                await asyncio.sleep(2)
-                continue
-            logger.exception("Download error")
-            _map_download_failure(platform, e, settings)
 
     if not path or not path.is_file():
+        if last_err is not None:
+            _map_download_failure(platform, last_err, settings)
         return DownloadResult(
             path=None,
             title=title,
