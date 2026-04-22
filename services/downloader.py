@@ -19,8 +19,8 @@ from utils.config import Settings
 from utils.urltools import normalize_http_url
 
 logger = logging.getLogger(__name__)
-_TW_I_STATUS_RE = re.compile(
-    r"^(https?://)(?:www\.)?(?:x\.com|twitter\.com)/i/status/(\d+)(?:[/?#].*)?$",
+_TW_STATUS_RE = re.compile(
+    r"^(?:https?://)?(?:www\.)?(?:x\.com|twitter\.com)/(?:i/(?:web/)?status|[^/?#]+/status)/(\d+)(?:[/?#].*)?$",
     re.I,
 )
 
@@ -169,16 +169,20 @@ def _build_ydl_opts(
 
 def _twitter_candidate_urls(url: str) -> list[str]:
     """Generate equivalent tweet URLs for extractor edge-cases."""
-    m = _TW_I_STATUS_RE.match(url.strip())
+    u = url.strip()
+    m = _TW_STATUS_RE.match(u)
     if not m:
         return [url]
-    tweet_id = m.group(2)
-    return [
-        url,
+    tweet_id = m.group(1)
+    candidates = [
+        u,
         f"https://x.com/i/web/status/{tweet_id}",
+        f"https://x.com/i/status/{tweet_id}",
         f"https://twitter.com/i/web/status/{tweet_id}",
         f"https://twitter.com/i/status/{tweet_id}",
     ]
+    # Preserve order while deduplicating.
+    return list(dict.fromkeys(candidates))
 
 
 def _twitter_ydl_opts_variants(ydl_opts: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
