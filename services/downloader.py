@@ -108,6 +108,7 @@ def _map_download_failure(platform: Platform, err: Exception, settings: Settings
 @dataclass
 class DownloadResult:
     path: Path | None
+    paths: list[Path]
     title: str | None
     direct_urls: list[str]
     platform: Platform
@@ -225,16 +226,21 @@ def _extract_direct_urls(url: str, settings: Settings) -> list[str]:
     return urls[:5]
 
 
-def _download_sync(url: str, ydl_opts: dict[str, Any]) -> tuple[Path | None, str | None]:
-    last_path: Path | None = None
+def _download_sync(url: str, ydl_opts: dict[str, Any]) -> tuple[list[Path], str | None]:
+    found_paths: list[Path] = []
     title: str | None = None
 
+    def add_path(p: Path | None) -> None:
+        if not p:
+            return
+        if p not in found_paths:
+            found_paths.append(p)
+
     def hook(d: dict[str, Any]) -> None:
-        nonlocal last_path
         if d.get("status") == "finished":
             fp = d.get("filename")
             if fp:
-                last_path = Path(fp)
+                add_path(Path(fp))
 
     opts = dict(ydl_opts)
     opts["progress_hooks"] = [hook]
@@ -245,18 +251,22 @@ def _download_sync(url: str, ydl_opts: dict[str, Any]) -> tuple[Path | None, str
         info = ydl.extract_info(url, download=True)
         if info:
             title = info.get("title") or info.get("id")
-            fn = ydl.prepare_filename(info)
-            candidate = Path(fn)
-            if candidate.is_file():
-                last_path = candidate
-            elif "requested_downloads" in info:
-                for part in info["requested_downloads"]:
-                    p = part.get("filepath")
-                    if p and Path(p).is_file():
-                        last_path = Path(p)
-                        break
+            items = [info]
+            if info.get("entries"):
+                items = [e for e in info["entries"] if isinstance(e, dict)]
 
-    return last_path, title
+            for item in items:
+                fn = ydl.prepare_filename(item)
+                candidate = Path(fn)
+                if candidate.is_file():
+                    add_path(candidate)
+                for part in item.get("requested_downloads") or []:
+                    p = part.get("filepath")
+                    if p:
+                        add_path(Path(p))
+
+    existing_paths = [p for p in found_paths if p.is_file()]
+    return existing_paths, title
 
 
 async def download_media(url: str, settings: Settings) -> DownloadResult:
@@ -281,7 +291,7 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
 
     logger.info("Downloading url=%s platform=%s", url, platform.value)
 
-    path: Path | None = None
+    paths: list[Path] = []
     title: str | None = None
     attempts = 1 if platform is Platform.INSTAGRAM else 2
     last_err: Exception | None = None
@@ -291,7 +301,7 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
         for candidate in candidate_urls:
             for attempt in range(attempts):
                 try:
-                    path, title = await asyncio.to_thread(_download_sync, candidate, opt_variant)
+                    paths, title = await asyncio.to_thread(_download_sync, candidate, opt_variant)
                     break
                 except yt_dlp.utils.DownloadError as e:
                     last_err = e
@@ -307,23 +317,25 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
                         await asyncio.sleep(2)
                         continue
                     logger.info("Download failed for candidate url=%s err=%s", candidate, e)
-            if path and path.is_file():
+            if paths:
                 break
-        if path and path.is_file():
+        if paths:
             break
 
-    if not path or not path.is_file():
+    if not paths:
         if last_err is not None:
             _map_download_failure(platform, last_err, settings)
         return DownloadResult(
             path=None,
+            paths=[],
             title=title,
             direct_urls=[],
             platform=platform,
         )
 
     return DownloadResult(
-        path=path,
+        path=paths[0],
+        paths=paths,
         title=title,
         direct_urls=[],
         platform=platform,
