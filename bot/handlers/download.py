@@ -7,8 +7,8 @@ from pathlib import Path
 
 from aiogram import F, Router
 from aiogram.enums import ChatAction
-from aiogram.types import FSInputFile, Message
 from aiogram.filters import Command, CommandStart
+from aiogram.types import FSInputFile, Message
 
 from services.compressor import compress_video
 from services.downloader import DownloadError, download_media, get_direct_urls
@@ -28,6 +28,7 @@ def _get_download_semaphore(limit: int) -> asyncio.Semaphore:
         sem = asyncio.Semaphore(limit)
         _DOWNLOAD_SEMAPHORES[limit] = sem
     return sem
+
 
 _URL_RE = re.compile(
     r"https?://[^\s<>\"]+|www\.[^\s<>\"]+",
@@ -82,23 +83,26 @@ async def on_text(
         return
 
     await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_VIDEO)
-    status = await message.reply("Downloading…")
+    status = await message.reply("Downloading...")
 
-    work_path: Path | None = None
-    compressed_path: Path | None = None
+    work_paths: list[Path] = []
+    compressed_paths: list[Path] = []
     semaphore = _get_download_semaphore(settings.max_concurrent_downloads)
 
     try:
         if semaphore.locked():
             await edit_or_replace_status(
                 status,
-                "Another download is in progress. Your request is queued now…",
+                "Another download is in progress. Your request is queued now...",
             )
+
         async with semaphore:
             result = await download_media(url, settings)
-            work_path = result.path
+            work_paths = [p for p in result.paths if p and p.is_file()]
+            if not work_paths and result.path and result.path.is_file():
+                work_paths = [result.path]
 
-            if not work_path or not work_path.is_file():
+            if not work_paths:
                 direct_urls = await get_direct_urls(url, settings)
                 lines = [
                     "Could not download a video file.",
@@ -111,48 +115,66 @@ async def on_text(
                 await edit_or_replace_status(status, "\n".join(lines))
                 return
 
-            size = work_path.stat().st_size
-            logger.info(
-                "Download ok path=%s size=%s title=%s",
-                work_path,
-                size,
-                result.title,
-            )
+            logger.info("Download ok files=%s title=%s", len(work_paths), result.title)
 
-            send_path = work_path
-            if size > settings.telegram_max_file_bytes and settings.enable_compression:
-                compressed_path = work_path.with_name(work_path.stem + "_compressed.mp4")
-                ok = await compress_video(
-                    work_path,
-                    compressed_path,
-                    settings.compress_target_bytes,
-                )
-                if ok and compressed_path.is_file():
-                    new_size = compressed_path.stat().st_size
-                    if new_size < size:
-                        send_path = compressed_path
-                        size = new_size
-                        logger.info("Compressed to %s bytes", size)
+            send_paths: list[Path] = []
+            oversize_paths: list[Path] = []
+            for source_path in work_paths:
+                send_path = source_path
+                size = source_path.stat().st_size
+
+                if size > settings.telegram_max_file_bytes and settings.enable_compression:
+                    compressed_path = source_path.with_name(source_path.stem + "_compressed.mp4")
+                    ok = await compress_video(
+                        source_path,
+                        compressed_path,
+                        settings.compress_target_bytes,
+                    )
+                    if ok and compressed_path.is_file():
+                        new_size = compressed_path.stat().st_size
+                        if new_size < size:
+                            send_path = compressed_path
+                            size = new_size
+                            compressed_paths.append(compressed_path)
+                            logger.info("Compressed to %s bytes (%s)", size, source_path.name)
+
+                if size <= settings.telegram_max_file_bytes:
+                    send_paths.append(send_path)
+                else:
+                    oversize_paths.append(send_path)
 
             caption = (result.title or "")[:1024]
-
-            if send_path.stat().st_size <= settings.telegram_max_file_bytes:
+            sent = 0
+            for idx, send_path in enumerate(send_paths):
                 await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_VIDEO)
                 vid = FSInputFile(send_path)
                 await message.answer_video(
                     vid,
-                    caption=caption or None,
+                    caption=(caption or None) if idx == 0 else None,
                     supports_streaming=True,
                     parse_mode=None,
                 )
+                sent += 1
+
+            if sent and not oversize_paths:
                 await status.delete()
             else:
                 direct_urls = await get_direct_urls(url, settings)
-                parts = [
-                    f"File is too large for Telegram ({send_path.stat().st_size // (1024*1024)} MB, "
-                    f"limit ~{settings.telegram_max_file_bytes // (1024*1024)} MB).",
-                    "Download links:",
-                ]
+                if sent:
+                    parts = [
+                        f"Sent {sent} video(s).",
+                        f"{len(oversize_paths)} file(s) are still too large for Telegram "
+                        f"(limit ~{settings.telegram_max_file_bytes // (1024*1024)} MB).",
+                        "Download links:",
+                    ]
+                else:
+                    largest = max((p.stat().st_size for p in oversize_paths), default=0)
+                    parts = [
+                        f"File is too large for Telegram ({largest // (1024*1024)} MB, "
+                        f"limit ~{settings.telegram_max_file_bytes // (1024*1024)} MB).",
+                        "Download links:",
+                    ]
+
                 for u in direct_urls[:5]:
                     parts.append(u)
                 if not direct_urls:
@@ -168,8 +190,5 @@ async def on_text(
         logger.exception("Handler error")
         await edit_or_replace_status(status, "Something went wrong. Please try again later.")
     finally:
-        await _safe_unlink(compressed_path)
-        # Keep original for debugging or delete — delete to save disk
-        if compressed_path and compressed_path != work_path:
-            pass
-        await _safe_unlink(work_path)
+        for p in [*compressed_paths, *work_paths]:
+            await _safe_unlink(p)
