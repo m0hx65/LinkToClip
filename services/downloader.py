@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import aiohttp
 import yt_dlp
 
 from platforms import Platform, detect_platform
@@ -20,7 +21,7 @@ from utils.urltools import normalize_http_url
 
 logger = logging.getLogger(__name__)
 _TW_STATUS_RE = re.compile(
-    r"^(?:https?://)?(?:www\.)?(?:x\.com|twitter\.com)/(?:i/(?:web/)?status|[^/?#]+/status)/(\d+)(?:[/?#].*)?$",
+    r"^(?:https?://)?(?:www\.)?(?:x\.com|twitter\.com)/(?:i/(?:web/)?status|(?P<user>[^/?#]+)/status)/(?P<id>\d+)(?:[/?#].*)?$",
     re.I,
 )
 
@@ -193,7 +194,7 @@ def _twitter_candidate_urls(url: str) -> list[str]:
     m = _TW_STATUS_RE.match(u)
     if not m:
         return [url]
-    tweet_id = m.group(1)
+    tweet_id = m.group("id")
     candidates = [
         u,
         f"https://x.com/i/web/status/{tweet_id}",
@@ -293,6 +294,48 @@ def _download_sync(url: str, ydl_opts: dict[str, Any]) -> tuple[list[Path], str 
     return existing_paths, title
 
 
+async def _fxtwitter_fallback(url: str, out_dir: Path, out_stem: str) -> tuple[list[Path], str | None]:
+    """Download via fxtwitter API — works from datacenter IPs without auth."""
+    m = _TW_STATUS_RE.match(url.strip())
+    if not m:
+        return [], None
+    tweet_id = m.group("id")
+    user = m.group("user") or "i"
+    api_url = f"https://api.fxtwitter.com/{user}/status/{tweet_id}"
+    paths: list[Path] = []
+    title: str | None = None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    logger.info("fxtwitter API %s for tweet %s", resp.status, tweet_id)
+                    return [], None
+                data = await resp.json()
+            tw = data.get("tweet") or {}
+            title = tw.get("text") or None
+            videos = (tw.get("media") or {}).get("videos") or []
+            for idx, video in enumerate(videos, 1):
+                video_url = video.get("url") if isinstance(video, dict) else None
+                if not video_url:
+                    continue
+                out_path = out_dir / f"{out_stem}_{idx}.mp4"
+                try:
+                    async with session.get(video_url, timeout=aiohttp.ClientTimeout(total=300)) as resp:
+                        if resp.status != 200:
+                            logger.info("fxtwitter video %s returned %s", idx, resp.status)
+                            continue
+                        with open(out_path, "wb") as f:
+                            async for chunk in resp.content.iter_chunked(8 * 1024 * 1024):
+                                f.write(chunk)
+                    if out_path.is_file() and out_path.stat().st_size > 0:
+                        paths.append(out_path)
+                except Exception as e:
+                    logger.info("fxtwitter video %s download error: %s", idx, e)
+    except Exception as e:
+        logger.info("fxtwitter fallback error: %s", e)
+    return paths, title
+
+
 async def download_media(url: str, settings: Settings) -> DownloadResult:
     url = normalize_http_url(url)
     platform = detect_platform(url)
@@ -345,6 +388,13 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
                 break
         if paths:
             break
+
+    if not paths and platform is Platform.TWITTER:
+        logger.info("yt-dlp exhausted; trying fxtwitter fallback url=%s", url)
+        fb_paths, fb_title = await _fxtwitter_fallback(url, out_dir, out_stem)
+        if fb_paths:
+            paths = fb_paths
+            title = title or fb_title
 
     if not paths:
         if last_err is not None:
