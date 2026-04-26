@@ -55,8 +55,12 @@ class _YtdlpLogger:
 
 
 def _cookiefile_for_platform(settings: Settings, platform: Platform) -> str | None:
-    # X/Twitter: guest-only (no cookiefile). yt-dlp uses GraphQL + syndication fallbacks below.
     if platform is Platform.TWITTER:
+        if settings.twitter_cookies_file and settings.twitter_cookies_file.is_file():
+            return str(settings.twitter_cookies_file)
+        # Fall back to general cookies file for Twitter too.
+        if settings.cookies_file and settings.cookies_file.is_file():
+            return str(settings.cookies_file)
         return None
     if settings.cookies_file and settings.cookies_file.is_file():
         return str(settings.cookies_file)
@@ -90,11 +94,24 @@ def _map_download_failure(platform: Platform, err: Exception, settings: Settings
             + (_IG_HELP_HAS_COOKIES if has else _IG_HELP_NO_COOKIES)
         ) from err
 
-    if platform is Platform.TWITTER and "no video could be found in this tweet" in msg:
-        raise DownloadError(
-            "Could not get a video from this X link. The post may have no video, or X did not "
-            "expose embeddable media to automated access (common for some threads or clips)."
-        ) from err
+    if platform is Platform.TWITTER:
+        _tw_has_cookies = bool(
+            (settings.twitter_cookies_file and settings.twitter_cookies_file.is_file())
+            or (settings.cookies_file and settings.cookies_file.is_file())
+        )
+        _tw_cookie_hint = (
+            " TWITTER_COOKIES_FILE is set — cookies may be expired; re-export from your browser."
+            if _tw_has_cookies
+            else " X now requires authentication for most content. Export a Netscape cookies.txt "
+            "while logged in at x.com and set TWITTER_COOKIES_FILE (or COOKIES_FILE)."
+        )
+        if "no video could be found in this tweet" in msg:
+            raise DownloadError(
+                "Could not get a video from this X link. The post may have no video, or "
+                "X blocked automated access." + _tw_cookie_hint
+            ) from err
+        if any(x in msg for x in ("401", "403", "unauthorized", "login", "cookies", "authenticate")):
+            raise DownloadError("X rejected the request (auth error)." + _tw_cookie_hint) from err
 
     if "private" in msg or "login" in msg or "cookies" in msg:
         raise DownloadError(
@@ -164,6 +181,9 @@ def _build_ydl_opts(
     platform = detect_platform(url)
     merged = _base_opts(out_dir, out_stem, settings, platform)
     merged = _merge_dict(merged, _platform_opts(platform))
+    if platform is Platform.TWITTER:
+        # Multi-video tweets are extracted as playlists; autonumber prevents filename collisions.
+        merged["outtmpl"] = str(out_dir / f"{out_stem}_%(autonumber)s.%(ext)s")
     return merged, platform
 
 
@@ -186,12 +206,12 @@ def _twitter_candidate_urls(url: str) -> list[str]:
 
 
 def _twitter_ydl_opts_variants(ydl_opts: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
-    """Guest-only strategies: default GraphQL, then syndication API."""
+    """Syndication first (works without auth), GraphQL second (works with cookies/auth)."""
     synd = _merge_dict(
         ydl_opts,
         {"extractor_args": {"twitter": {"api": ["syndication"]}}},
     )
-    return [("graphql", ydl_opts), ("syndication", synd)]
+    return [("syndication", synd), ("graphql", ydl_opts)]
 
 
 def _extract_direct_urls(url: str, settings: Settings) -> list[str]:
