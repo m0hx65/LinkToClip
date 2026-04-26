@@ -347,20 +347,30 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
     out_dir = settings.temp_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     out_stem = f"{uuid.uuid4().hex}"
-    ydl_opts, _ = _build_ydl_opts(url, out_dir, out_stem, settings)
-    candidate_urls = (
-        _twitter_candidate_urls(url) if platform is Platform.TWITTER else [url]
-    )
-    if platform is Platform.TWITTER:
-        opts_variants = _twitter_ydl_opts_variants(ydl_opts)
-    else:
-        opts_variants = [("default", ydl_opts)]
 
     logger.info("Downloading url=%s platform=%s", url, platform.value)
 
     paths: list[Path] = []
     title: str | None = None
-    attempts = 1 if platform is Platform.INSTAGRAM else 2
+
+    # Twitter: fxtwitter first — instant on cloud IPs, no auth needed.
+    # Fall through to yt-dlp only if fxtwitter has no video (private/deleted/no-media tweet).
+    if platform is Platform.TWITTER:
+        paths, title = await _fxtwitter_fallback(url, out_dir, out_stem)
+        if paths:
+            logger.info("fxtwitter ok files=%s", len(paths))
+            return DownloadResult(path=paths[0], paths=paths, title=title, direct_urls=[], platform=platform)
+        logger.info("fxtwitter no videos; falling back to yt-dlp")
+
+    ydl_opts, _ = _build_ydl_opts(url, out_dir, out_stem, settings)
+    candidate_urls = (
+        _twitter_candidate_urls(url) if platform is Platform.TWITTER else [url]
+    )
+    opts_variants = (
+        _twitter_ydl_opts_variants(ydl_opts) if platform is Platform.TWITTER else [("default", ydl_opts)]
+    )
+    # Twitter: fxtwitter already failed so skip retries — yt-dlp is a last resort.
+    attempts = 1 if platform in (Platform.INSTAGRAM, Platform.TWITTER) else 2
     last_err: Exception | None = None
     for strategy_name, opt_variant in opts_variants:
         if platform is Platform.TWITTER:
@@ -389,31 +399,12 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
         if paths:
             break
 
-    if not paths and platform is Platform.TWITTER:
-        logger.info("yt-dlp exhausted; trying fxtwitter fallback url=%s", url)
-        fb_paths, fb_title = await _fxtwitter_fallback(url, out_dir, out_stem)
-        if fb_paths:
-            paths = fb_paths
-            title = title or fb_title
-
     if not paths:
         if last_err is not None:
             _map_download_failure(platform, last_err, settings)
-        return DownloadResult(
-            path=None,
-            paths=[],
-            title=title,
-            direct_urls=[],
-            platform=platform,
-        )
+        return DownloadResult(path=None, paths=[], title=title, direct_urls=[], platform=platform)
 
-    return DownloadResult(
-        path=paths[0],
-        paths=paths,
-        title=title,
-        direct_urls=[],
-        platform=platform,
-    )
+    return DownloadResult(path=paths[0], paths=paths, title=title, direct_urls=[], platform=platform)
 
 
 async def get_direct_urls(url: str, settings: Settings) -> list[str]:
