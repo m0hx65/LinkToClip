@@ -10,7 +10,7 @@ from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandStart
 from aiogram.types import FSInputFile, Message
 
-from services.compressor import compress_video
+from services.compressor import compress_video, split_video
 from services.downloader import DownloadError, download_media, get_direct_urls
 from utils.config import Settings
 from utils.messaging import edit_or_replace_status
@@ -87,6 +87,7 @@ async def on_text(
 
     work_paths: list[Path] = []
     compressed_paths: list[Path] = []
+    part_paths: list[Path] = []
     semaphore = _get_download_semaphore(settings.max_concurrent_downloads)
 
     try:
@@ -117,10 +118,8 @@ async def on_text(
 
             logger.info("Download ok files=%s title=%s", len(work_paths), result.title)
 
-            send_paths: list[Path] = []
-            oversize_paths: list[Path] = []
+            send_items: list[tuple[Path, str | None]] = []
             for source_path in work_paths:
-                send_path = source_path
                 size = source_path.stat().st_size
 
                 if size > settings.telegram_max_file_bytes and settings.enable_compression:
@@ -133,55 +132,55 @@ async def on_text(
                     if ok and compressed_path.is_file():
                         new_size = compressed_path.stat().st_size
                         if new_size < size:
-                            send_path = compressed_path
+                            source_path = compressed_path
                             size = new_size
                             compressed_paths.append(compressed_path)
-                            logger.info("Compressed to %s bytes (%s)", size, source_path.name)
+                            logger.info("Compressed to %s bytes", size)
 
                 if size <= settings.telegram_max_file_bytes:
-                    send_paths.append(send_path)
+                    send_items.append((source_path, None))
                 else:
-                    oversize_paths.append(send_path)
+                    await edit_or_replace_status(
+                        status,
+                        f"File is {size // (1024*1024)} MB — splitting into parts...",
+                    )
+                    parts = await split_video(
+                        source_path, source_path.parent, settings.telegram_max_file_bytes
+                    )
+                    if parts:
+                        n = len(parts)
+                        for i, p in enumerate(parts, 1):
+                            send_items.append((p, f"Part {i}/{n}"))
+                        part_paths.extend(parts)
+                        logger.info("Split into %d parts: %s", n, source_path.name)
+                    else:
+                        logger.warning("Split failed for %s", source_path)
 
             caption = (result.title or "")[:1024]
-            sent = 0
-            for idx, send_path in enumerate(send_paths):
+            for idx, (send_path, part_label) in enumerate(send_items):
                 await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_VIDEO)
                 vid = FSInputFile(send_path)
+                if part_label:
+                    cap = f"{caption}\n{part_label}" if (caption and idx == 0) else part_label
+                else:
+                    cap = (caption or None) if idx == 0 else None
                 await message.answer_video(
                     vid,
-                    caption=(caption or None) if idx == 0 else None,
+                    caption=cap,
                     supports_streaming=True,
                     parse_mode=None,
                 )
-                sent += 1
 
-            if sent and not oversize_paths:
+            if send_items:
                 await status.delete()
             else:
                 direct_urls = await get_direct_urls(url, settings)
-                if sent:
-                    parts = [
-                        f"Sent {sent} video(s).",
-                        f"{len(oversize_paths)} file(s) are still too large for Telegram "
-                        f"(limit ~{settings.telegram_max_file_bytes // (1024*1024)} MB).",
-                        "Download links:",
-                    ]
-                else:
-                    largest = max((p.stat().st_size for p in oversize_paths), default=0)
-                    parts = [
-                        f"File is too large for Telegram ({largest // (1024*1024)} MB, "
-                        f"limit ~{settings.telegram_max_file_bytes // (1024*1024)} MB).",
-                        "Download links:",
-                    ]
-
+                lines = ["Could not send the video (splitting failed). Download links:"]
                 for u in direct_urls[:5]:
-                    parts.append(u)
+                    lines.append(u)
                 if not direct_urls:
-                    parts.append(
-                        "No stable direct URL. Try a shorter clip or download on a PC with yt-dlp."
-                    )
-                await edit_or_replace_status(status, "\n".join(parts))
+                    lines.append("No stable direct URL. Try downloading on a PC with yt-dlp.")
+                await edit_or_replace_status(status, "\n".join(lines))
 
     except DownloadError as e:
         logger.warning("DownloadError: %s", e)
@@ -190,5 +189,5 @@ async def on_text(
         logger.exception("Handler error")
         await edit_or_replace_status(status, "Something went wrong. Please try again later.")
     finally:
-        for p in [*compressed_paths, *work_paths]:
+        for p in [*part_paths, *compressed_paths, *work_paths]:
             await _safe_unlink(p)

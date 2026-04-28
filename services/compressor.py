@@ -134,3 +134,58 @@ async def make_ios_compatible(input_path: Path, output_path: Path) -> bool:
         logger.error("ffmpeg not found on PATH")
         return False
     return await asyncio.to_thread(_run_ios_compatible_sync, input_path, output_path)
+
+
+def _split_video_sync(input_path: Path, output_dir: Path, max_bytes: int) -> list[Path]:
+    try:
+        dur_s = float(
+            subprocess.check_output(
+                [
+                    "ffprobe", "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    str(input_path),
+                ],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        )
+    except (subprocess.CalledProcessError, ValueError, FileNotFoundError):
+        return []
+
+    if dur_s <= 0:
+        return []
+
+    file_size = input_path.stat().st_size
+    # 80% headroom to account for keyframe boundary variance with -c copy
+    segment_secs = dur_s * (max_bytes * 0.80 / file_size)
+    segment_secs = max(segment_secs, 1.0)
+
+    stem = input_path.stem
+    pattern = str(output_dir / f"{stem}_part%03d.mp4")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(input_path),
+        "-c", "copy",
+        "-map", "0",
+        "-f", "segment",
+        "-segment_time", f"{segment_secs:.2f}",
+        "-reset_timestamps", "1",
+        pattern,
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        logger.warning("ffmpeg split failed: %s", e)
+        return []
+
+    parts = sorted(output_dir.glob(f"{stem}_part*.mp4"))
+    return [p for p in parts if p.is_file() and p.stat().st_size > 0]
+
+
+async def split_video(input_path: Path, output_dir: Path, max_bytes: int) -> list[Path]:
+    if not await ffmpeg_available():
+        logger.error("ffmpeg not found on PATH")
+        return []
+    return await asyncio.to_thread(_split_video_sync, input_path, output_dir, max_bytes)
