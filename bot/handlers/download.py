@@ -8,7 +8,7 @@ from pathlib import Path
 from aiogram import F, Router
 from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandStart
-from aiogram.types import FSInputFile, Message
+from aiogram.types import FSInputFile, InputMediaPhoto, Message
 
 from services.compressor import compress_video, split_video
 from services.downloader import DownloadError, download_media, get_direct_urls
@@ -40,6 +40,13 @@ _BARE_HOST = re.compile(
 )
 
 
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+
+
+def _is_image(path: Path) -> bool:
+    return path.suffix.lower() in _IMAGE_EXTS
+
+
 def _extract_url(text: str) -> str | None:
     text = text.strip()
     m = _URL_RE.search(text)
@@ -63,8 +70,9 @@ async def _safe_unlink(path: Path | None) -> None:
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     await message.answer(
-        "Send a video link from <b>Instagram</b> (reel/story/post), <b>TikTok</b>, "
-        "<b>X/Twitter</b>, or <b>YouTube</b>.\nI'll download and send the video here."
+        "Send a link from <b>Instagram</b> (reel/post/carousel), <b>TikTok</b>, "
+        "<b>X/Twitter</b>, or <b>YouTube</b>.\n"
+        "I'll download and send the video or photos here."
     )
 
 
@@ -106,7 +114,7 @@ async def on_text(
             if not work_paths:
                 direct_urls = await get_direct_urls(url, settings)
                 lines = [
-                    "Could not download a video file.",
+                    "Could not download the media file.",
                     "You can try opening this link in a browser:",
                 ]
                 for u in direct_urls[:3]:
@@ -118,8 +126,41 @@ async def on_text(
 
             logger.info("Download ok files=%s title=%s", len(work_paths), result.title)
 
+            photo_paths = [p for p in work_paths if _is_image(p)]
+            video_paths = [p for p in work_paths if not _is_image(p)]
+
+            caption = (result.title or "")[:1024]
+            caption_used = False
+            sent_anything = False
+
+            # --- Send photos (single or carousel groups of up to 10) ---
+            if photo_paths:
+                await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
+                for chunk_start in range(0, len(photo_paths), 10):
+                    chunk = photo_paths[chunk_start:chunk_start + 10]
+                    cap = (caption or None) if not caption_used else None
+                    if len(chunk) == 1:
+                        await message.answer_photo(
+                            FSInputFile(chunk[0]),
+                            caption=cap,
+                            parse_mode=None,
+                        )
+                    else:
+                        media = [
+                            InputMediaPhoto(
+                                media=FSInputFile(p),
+                                caption=(cap if j == 0 else None),
+                                parse_mode=None,
+                            )
+                            for j, p in enumerate(chunk)
+                        ]
+                        await message.answer_media_group(media)
+                    caption_used = True
+                    sent_anything = True
+
+            # --- Send videos (with optional compression / splitting) ---
             send_items: list[tuple[Path, str | None]] = []
-            for source_path in work_paths:
+            for source_path in video_paths:
                 size = source_path.stat().st_size
 
                 if size > settings.telegram_max_file_bytes and settings.enable_compression:
@@ -156,26 +197,27 @@ async def on_text(
                     else:
                         logger.warning("Split failed for %s", source_path)
 
-            caption = (result.title or "")[:1024]
-            for idx, (send_path, part_label) in enumerate(send_items):
+            for send_path, part_label in send_items:
                 await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_VIDEO)
                 vid = FSInputFile(send_path)
-                if part_label:
-                    cap = f"{caption}\n{part_label}" if (caption and idx == 0) else part_label
+                if not caption_used:
+                    cap = f"{caption}\n{part_label}" if (caption and part_label) else (caption or part_label or None)
+                    caption_used = True
                 else:
-                    cap = (caption or None) if idx == 0 else None
+                    cap = part_label
                 await message.answer_video(
                     vid,
                     caption=cap,
                     supports_streaming=True,
                     parse_mode=None,
                 )
+                sent_anything = True
 
-            if send_items:
+            if sent_anything:
                 await status.delete()
             else:
                 direct_urls = await get_direct_urls(url, settings)
-                lines = ["Could not send the video (splitting failed). Download links:"]
+                lines = ["Could not send the file (splitting failed). Download links:"]
                 for u in direct_urls[:5]:
                     lines.append(u)
                 if not direct_urls:

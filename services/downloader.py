@@ -91,7 +91,7 @@ def _map_download_failure(platform: Platform, err: Exception, settings: Settings
             raise DownloadError(f"Unsupported URL: {raw[:280]}") from err
         has = bool(settings.cookies_file and settings.cookies_file.is_file())
         raise DownloadError(
-            "Instagram did not return this video to the server. "
+            "Instagram did not return this content to the server. "
             + (_IG_HELP_HAS_COOKIES if has else _IG_HELP_NO_COOKIES)
         ) from err
 
@@ -182,8 +182,9 @@ def _build_ydl_opts(
     platform = detect_platform(url)
     merged = _base_opts(out_dir, out_stem, settings, platform)
     merged = _merge_dict(merged, _platform_opts(platform))
-    if platform is Platform.TWITTER:
-        # Multi-video tweets are extracted as playlists; autonumber prevents filename collisions.
+    if platform in (Platform.TWITTER, Platform.INSTAGRAM):
+        # Multi-entry results (multi-video tweets, photo carousels) need autonumber to prevent
+        # filename collisions when multiple files are downloaded into the same directory.
         merged["outtmpl"] = str(out_dir / f"{out_stem}_%(autonumber)s.%(ext)s")
     return merged, platform
 
