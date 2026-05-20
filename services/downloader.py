@@ -7,6 +7,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 import yt_dlp
@@ -21,6 +22,10 @@ from utils.urltools import normalize_http_url
 
 logger = logging.getLogger(__name__)
 _IG_STORY_RE = re.compile(r"instagram\.com/stories/", re.I)
+# Matches a bare profile URL — instagram.com/username or instagram.com/username?igsh=...
+# Used to give a clear "not downloadable" error before wasting a download attempt.
+_IG_PROFILE_RE = re.compile(r"instagram\.com/([^/?#]+)/?(?:\?|#|$)", re.I)
+_IG_CONTENT_PATH_RE = re.compile(r"instagram\.com/(?:p|reel|tv|stories|reels)/", re.I)
 _TW_STATUS_RE = re.compile(
     r"^(?:https?://)?(?:www\.)?(?:x\.com|twitter\.com)/(?:i/(?:web/)?status|(?P<user>[^/?#]+)/status)/(?P<id>\d+)(?:[/?#].*)?$",
     re.I,
@@ -345,17 +350,38 @@ async def _fxtwitter_fallback(url: str, out_dir: Path, out_stem: str) -> tuple[l
     return paths, title
 
 
-async def _story_api_fallback(url: str, out_dir: Path, out_stem: str) -> tuple[list[Path], str | None]:
-    """Download Instagram story via saveig.app — no login needed for public accounts.
+def _clean_ig_url(url: str) -> str:
+    """Strip Instagram share-tracking params (igsh, utm_*) that confuse third-party APIs."""
+    p = urlparse(url)
+    path = p.path.rstrip("/") + "/"
+    return urlunparse((p.scheme or "https", p.netloc, path, "", "", ""))
 
-    saveig.app uses its own Instagram session on the backend, so callers don't need cookies.
-    Falls through gracefully if the service is down or returns no media.
+
+def _is_ig_profile_url(url: str) -> bool:
+    """Return True if url is a bare Instagram profile link with no downloadable content path."""
+    return bool(_IG_PROFILE_RE.search(url) and not _IG_CONTENT_PATH_RE.search(url))
+
+
+async def _story_api_fallback(url: str, out_dir: Path, out_stem: str) -> tuple[list[Path], str | None]:
+    """Download Instagram story via third-party APIs — no login needed for public accounts.
+
+    Tries two services in order:
+    1. saveig.app  — general Instagram downloader (posts/reels/stories)
+    2. cobalt.tools — open-source media downloader with Instagram support
+
+    Both use their own backend sessions so callers need no cookies.
+    Falls through gracefully if a service is down or returns no media.
     """
+    clean_url = _clean_ig_url(url)
+    logger.info("Story fallback clean_url=%s", clean_url)
+    media_urls: list[str] = []
+
+    # --- Attempt 1: saveig.app ---
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 "https://v3.saveig.app/api/ajaxSearch",
-                data={"q": url, "t": "media", "lang": "en"},
+                data={"q": clean_url, "t": "media", "lang": "en"},
                 headers={
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -366,22 +392,50 @@ async def _story_api_fallback(url: str, out_dir: Path, out_stem: str) -> tuple[l
                 },
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
-                if resp.status != 200:
-                    logger.info("saveig.app HTTP %s for story url", resp.status)
-                    return [], None
-                data = await resp.json(content_type=None)
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    html = data.get("data", "")
+                    found = list(dict.fromkeys(re.findall(
+                        r'https://[^\s"\'<>]+?\.(?:mp4|jpg|jpeg|png)(?:\?[^\s"\'<>]*)?',
+                        html, re.I,
+                    )))
+                    media_urls.extend(found)
+                    logger.info("saveig.app returned %d media URL(s)", len(found))
+                else:
+                    logger.info("saveig.app HTTP %s", resp.status)
     except Exception as e:
-        logger.info("saveig.app story request error: %s", e)
-        return [], None
+        logger.info("saveig.app error: %s", e)
 
-    html = data.get("data", "")
-    # Extract all direct media URLs from the HTML snippet saveig returns
-    media_urls = list(dict.fromkeys(re.findall(
-        r'https://[^\s"\'<>]+?\.(?:mp4|jpg|jpeg|png)(?:\?[^\s"\'<>]*)?',
-        html, re.I,
-    )))
+    # --- Attempt 2: cobalt.tools (open-source, supports Instagram) ---
     if not media_urls:
-        logger.info("saveig.app story: no media URLs in response")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://api.cobalt.tools/api/json",
+                    json={"url": clean_url, "vQuality": "max"},
+                    headers={
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                        "User-Agent": "Mozilla/5.0",
+                    },
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        status = data.get("status")
+                        if status in ("stream", "redirect") and data.get("url"):
+                            media_urls.append(data["url"])
+                        elif status == "picker":
+                            for item in data.get("picker", []):
+                                if item.get("url"):
+                                    media_urls.append(item["url"])
+                        logger.info("cobalt.tools status=%s found=%d URL(s)", status, len(media_urls))
+                    else:
+                        logger.info("cobalt.tools HTTP %s", resp.status)
+        except Exception as e:
+            logger.info("cobalt.tools error: %s", e)
+
+    if not media_urls:
         return [], None
 
     paths: list[Path] = []
@@ -396,7 +450,7 @@ async def _story_api_fallback(url: str, out_dir: Path, out_stem: str) -> tuple[l
                     timeout=aiohttp.ClientTimeout(total=120),
                 ) as resp:
                     if resp.status != 200:
-                        logger.info("saveig.app story media %s HTTP %s", idx, resp.status)
+                        logger.info("Story media %s HTTP %s", idx, resp.status)
                         continue
                     with open(out_path, "wb") as f:
                         async for chunk in resp.content.iter_chunked(8 * 1024 * 1024):
@@ -404,7 +458,7 @@ async def _story_api_fallback(url: str, out_dir: Path, out_stem: str) -> tuple[l
                 if out_path.is_file() and out_path.stat().st_size > 0:
                     paths.append(out_path)
             except Exception as e:
-                logger.info("saveig.app story media %s download error: %s", idx, e)
+                logger.info("Story media %s download error: %s", idx, e)
 
     return paths, None
 
@@ -415,6 +469,11 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
     if platform is Platform.UNKNOWN:
         raise DownloadError(
             "Unsupported URL. Send a link from Instagram, TikTok, X (Twitter), or YouTube."
+        )
+    if platform is Platform.INSTAGRAM and _is_ig_profile_url(url):
+        raise DownloadError(
+            "That looks like an Instagram profile link — there's no media to download. "
+            "Send a direct link to a post, reel, or story."
         )
 
     out_dir = settings.temp_dir
