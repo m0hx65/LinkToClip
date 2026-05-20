@@ -485,14 +485,16 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
     paths: list[Path] = []
     title: str | None = None
 
-    # Instagram stories: try saveig.app first — their backend is logged in so no cookies needed.
-    # Skip for highlights (/stories/highlights/…) because yt-dlp handles those fine without auth.
+    # Instagram stories require a logged-in session — skip straight to a clear error.
+    # Highlights (/stories/highlights/…) are different and work via yt-dlp without auth.
     if platform is Platform.INSTAGRAM and _IG_STORY_RE.search(url) and "/highlights/" not in url.lower():
-        paths, title = await _story_api_fallback(url, out_dir, out_stem)
-        if paths:
-            logger.info("Story API fallback ok files=%s", len(paths))
-            return DownloadResult(path=paths[0], paths=paths, title=title, direct_urls=[], platform=platform)
-        logger.info("Story API fallback returned nothing; trying yt-dlp")
+        has_cookies = bool(settings.cookies_file and settings.cookies_file.is_file())
+        if not has_cookies:
+            raise DownloadError(
+                "Instagram story downloading requires cookies. "
+                "Export a Netscape cookies.txt while logged in at instagram.com and set "
+                "COOKIES_FILE (e.g. in Render → Environment)."
+            )
 
     # Twitter: fxtwitter first — instant on cloud IPs, no auth needed.
     # Fall through to yt-dlp only if fxtwitter has no video (private/deleted/no-media tweet).
