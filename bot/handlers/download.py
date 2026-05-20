@@ -70,9 +70,11 @@ async def _safe_unlink(path: Path | None) -> None:
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     await message.answer(
-        "Send a link from <b>Instagram</b> (reel/post/carousel), <b>TikTok</b>, "
+        "Send a link from <b>Instagram</b> (reel/post/carousel/story/highlight), <b>TikTok</b>, "
         "<b>X/Twitter</b>, or <b>YouTube</b>.\n"
-        "I'll download and send the video or photos here."
+        "I'll download and send the video or photos here.\n\n"
+        "<b>Instagram stories</b> from public accounts work without login. "
+        "Private account stories require setting <code>COOKIES_FILE</code>."
     )
 
 

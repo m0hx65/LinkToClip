@@ -20,6 +20,7 @@ from utils.config import Settings
 from utils.urltools import normalize_http_url
 
 logger = logging.getLogger(__name__)
+_IG_STORY_RE = re.compile(r"instagram\.com/stories/", re.I)
 _TW_STATUS_RE = re.compile(
     r"^(?:https?://)?(?:www\.)?(?:x\.com|twitter\.com)/(?:i/(?:web/)?status|(?P<user>[^/?#]+)/status)/(?P<id>\d+)(?:[/?#].*)?$",
     re.I,
@@ -68,7 +69,7 @@ def _cookiefile_for_platform(settings: Settings, platform: Platform) -> str | No
     return None
 
 
-def _map_download_failure(platform: Platform, err: Exception, settings: Settings) -> None:
+def _map_download_failure(platform: Platform, err: Exception, settings: Settings, url: str = "") -> None:
     """Raise DownloadError with a user-facing message; logs full yt-dlp output."""
     raw = str(err)
     msg = raw.lower()
@@ -90,6 +91,13 @@ def _map_download_failure(platform: Platform, err: Exception, settings: Settings
         if "unsupported url" in msg:
             raise DownloadError(f"Unsupported URL: {raw[:280]}") from err
         has = bool(settings.cookies_file and settings.cookies_file.is_file())
+        if _IG_STORY_RE.search(url) and "/highlights/" not in url.lower():
+            raise DownloadError(
+                "Could not download this story. The third-party fallback (saveig.app) returned "
+                "nothing and yt-dlp also failed. Stories from private accounts always need cookies; "
+                "for public accounts saveig.app may be temporarily down. "
+                + (_IG_HELP_HAS_COOKIES if has else _IG_HELP_NO_COOKIES)
+            ) from err
         raise DownloadError(
             "Instagram did not return this content to the server. "
             + (_IG_HELP_HAS_COOKIES if has else _IG_HELP_NO_COOKIES)
@@ -337,6 +345,70 @@ async def _fxtwitter_fallback(url: str, out_dir: Path, out_stem: str) -> tuple[l
     return paths, title
 
 
+async def _story_api_fallback(url: str, out_dir: Path, out_stem: str) -> tuple[list[Path], str | None]:
+    """Download Instagram story via saveig.app — no login needed for public accounts.
+
+    saveig.app uses its own Instagram session on the backend, so callers don't need cookies.
+    Falls through gracefully if the service is down or returns no media.
+    """
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://v3.saveig.app/api/ajaxSearch",
+                data={"q": url, "t": "media", "lang": "en"},
+                headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "X-Requested-With": "XMLHttpRequest",
+                    "Origin": "https://saveig.app",
+                    "Referer": "https://saveig.app/en",
+                },
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    logger.info("saveig.app HTTP %s for story url", resp.status)
+                    return [], None
+                data = await resp.json(content_type=None)
+    except Exception as e:
+        logger.info("saveig.app story request error: %s", e)
+        return [], None
+
+    html = data.get("data", "")
+    # Extract all direct media URLs from the HTML snippet saveig returns
+    media_urls = list(dict.fromkeys(re.findall(
+        r'https://[^\s"\'<>]+?\.(?:mp4|jpg|jpeg|png)(?:\?[^\s"\'<>]*)?',
+        html, re.I,
+    )))
+    if not media_urls:
+        logger.info("saveig.app story: no media URLs in response")
+        return [], None
+
+    paths: list[Path] = []
+    async with aiohttp.ClientSession() as session:
+        for idx, media_url in enumerate(media_urls, 1):
+            ext = "mp4" if ".mp4" in media_url.lower() else "jpg"
+            out_path = out_dir / f"{out_stem}_s{idx}.{ext}"
+            try:
+                async with session.get(
+                    media_url,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=aiohttp.ClientTimeout(total=120),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.info("saveig.app story media %s HTTP %s", idx, resp.status)
+                        continue
+                    with open(out_path, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(8 * 1024 * 1024):
+                            f.write(chunk)
+                if out_path.is_file() and out_path.stat().st_size > 0:
+                    paths.append(out_path)
+            except Exception as e:
+                logger.info("saveig.app story media %s download error: %s", idx, e)
+
+    return paths, None
+
+
 async def download_media(url: str, settings: Settings) -> DownloadResult:
     url = normalize_http_url(url)
     platform = detect_platform(url)
@@ -353,6 +425,15 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
 
     paths: list[Path] = []
     title: str | None = None
+
+    # Instagram stories: try saveig.app first — their backend is logged in so no cookies needed.
+    # Skip for highlights (/stories/highlights/…) because yt-dlp handles those fine without auth.
+    if platform is Platform.INSTAGRAM and _IG_STORY_RE.search(url) and "/highlights/" not in url.lower():
+        paths, title = await _story_api_fallback(url, out_dir, out_stem)
+        if paths:
+            logger.info("Story API fallback ok files=%s", len(paths))
+            return DownloadResult(path=paths[0], paths=paths, title=title, direct_urls=[], platform=platform)
+        logger.info("Story API fallback returned nothing; trying yt-dlp")
 
     # Twitter: fxtwitter first — instant on cloud IPs, no auth needed.
     # Fall through to yt-dlp only if fxtwitter has no video (private/deleted/no-media tweet).
@@ -402,7 +483,7 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
 
     if not paths:
         if last_err is not None:
-            _map_download_failure(platform, last_err, settings)
+            _map_download_failure(platform, last_err, settings, url)
         return DownloadResult(path=None, paths=[], title=title, direct_urls=[], platform=platform)
 
     return DownloadResult(path=paths[0], paths=paths, title=title, direct_urls=[], platform=platform)
