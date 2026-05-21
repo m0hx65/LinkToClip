@@ -15,11 +15,6 @@ def ytdlp_overrides() -> dict[str, Any]:
             "/bv*[ext=mp4]+ba[ext=m4a]"                # any MP4 video + AAC (H.265 fallback)
             "/bv*+ba/best"                             # last resort
         ),
-        # When audio transcoding is unavoidable (e.g. Opus→AAC fallback), use 192k.
-        # YouTube's default Opus audio is 160k; transcoding at lower bitrate degrades it.
-        "postprocessor_args": {
-            "ffmpeg": ["-c:a", "aac", "-b:a", "192k"],
-        },
         # ios/android clients bypass YouTube's bot-detection that blocks datacenter IPs.
         "extractor_args": {"youtube": {"player_client": ["ios", "android", "web"]}},
     }
