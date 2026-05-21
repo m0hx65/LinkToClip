@@ -106,7 +106,21 @@ async def on_text(
             )
 
         async with semaphore:
-            result = await download_media(url, settings)
+            _MAX_RETRIES = 3
+            result = None
+            for _attempt in range(_MAX_RETRIES + 1):
+                try:
+                    result = await download_media(url, settings)
+                    break
+                except DownloadError as e:
+                    if not e.retryable or _attempt >= _MAX_RETRIES:
+                        raise
+                    await edit_or_replace_status(
+                        status,
+                        f"Download failed, retrying... ({_attempt + 1}/{_MAX_RETRIES})",
+                    )
+                    await asyncio.sleep(3)
+
             work_paths = [p for p in result.paths if p and p.is_file()]
             if not work_paths and result.path and result.path.is_file():
                 work_paths = [result.path]

@@ -42,7 +42,9 @@ _IG_HELP_HAS_COOKIES = (
 
 
 class DownloadError(Exception):
-    pass
+    def __init__(self, message: str, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class _YtdlpLogger:
@@ -90,22 +92,24 @@ def _map_download_failure(platform: Platform, err: Exception, settings: Settings
             "does not exist",
         )
     ):
-        raise DownloadError("This video is unavailable or the link is invalid.") from err
+        raise DownloadError("This video is unavailable or the link is invalid.", retryable=False) from err
 
     if platform is Platform.INSTAGRAM:
         if "unsupported url" in msg:
-            raise DownloadError(f"Unsupported URL: {raw[:280]}") from err
+            raise DownloadError(f"Unsupported URL: {raw[:280]}", retryable=False) from err
         has = bool(settings.cookies_file and settings.cookies_file.is_file())
         if _IG_STORY_RE.search(url) and "/highlights/" not in url.lower():
             raise DownloadError(
                 "Could not download this story. The third-party fallback (saveig.app) returned "
                 "nothing and yt-dlp also failed. Stories from private accounts always need cookies; "
                 "for public accounts saveig.app may be temporarily down. "
-                + (_IG_HELP_HAS_COOKIES if has else _IG_HELP_NO_COOKIES)
+                + (_IG_HELP_HAS_COOKIES if has else _IG_HELP_NO_COOKIES),
+                retryable=False,
             ) from err
         raise DownloadError(
             "Instagram did not return this content to the server. "
-            + (_IG_HELP_HAS_COOKIES if has else _IG_HELP_NO_COOKIES)
+            + (_IG_HELP_HAS_COOKIES if has else _IG_HELP_NO_COOKIES),
+            retryable=True,
         ) from err
 
     if platform is Platform.TWITTER:
@@ -122,18 +126,20 @@ def _map_download_failure(platform: Platform, err: Exception, settings: Settings
         if "no video could be found in this tweet" in msg:
             raise DownloadError(
                 "Could not get a video from this X link. The post may have no video, or "
-                "X blocked automated access." + _tw_cookie_hint
+                "X blocked automated access." + _tw_cookie_hint,
+                retryable=False,
             ) from err
         if any(x in msg for x in ("401", "403", "unauthorized", "login", "cookies", "authenticate")):
-            raise DownloadError("X rejected the request (auth error)." + _tw_cookie_hint) from err
+            raise DownloadError("X rejected the request (auth error)." + _tw_cookie_hint, retryable=False) from err
 
     if "private" in msg or "login" in msg or "cookies" in msg:
         raise DownloadError(
             "This content is private or requires login. "
-            "If the site is Instagram, add COOKIES_FILE with a browser cookies export."
+            "If the site is Instagram, add COOKIES_FILE with a browser cookies export.",
+            retryable=False,
         ) from err
 
-    raise DownloadError(f"Download failed: {raw[:500]}") from err
+    raise DownloadError(f"Download failed: {raw[:500]}", retryable=True) from err
 
 
 @dataclass
@@ -468,12 +474,14 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
     platform = detect_platform(url)
     if platform is Platform.UNKNOWN:
         raise DownloadError(
-            "Unsupported URL. Send a link from Instagram, TikTok, X (Twitter), or YouTube."
+            "Unsupported URL. Send a link from Instagram, TikTok, X (Twitter), or YouTube.",
+            retryable=False,
         )
     if platform is Platform.INSTAGRAM and _is_ig_profile_url(url):
         raise DownloadError(
             "That looks like an Instagram profile link — there's no media to download. "
-            "Send a direct link to a post, reel, or story."
+            "Send a direct link to a post, reel, or story.",
+            retryable=False,
         )
 
     out_dir = settings.temp_dir
@@ -493,7 +501,8 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
             raise DownloadError(
                 "Instagram story downloading requires cookies. "
                 "Export a Netscape cookies.txt while logged in at instagram.com and set "
-                "COOKIES_FILE (e.g. in Render → Environment)."
+                "COOKIES_FILE (e.g. in Render → Environment).",
+                retryable=False,
             )
 
     # Twitter: fxtwitter first — instant on cloud IPs, no auth needed.
