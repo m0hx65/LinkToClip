@@ -67,7 +67,12 @@ def _cookiefile_for_platform(settings: Settings, platform: Platform) -> str | No
     if platform is Platform.TWITTER:
         if settings.twitter_cookies_file and settings.twitter_cookies_file.is_file():
             return str(settings.twitter_cookies_file)
-        # Fall back to general cookies file for Twitter too.
+        if settings.cookies_file and settings.cookies_file.is_file():
+            return str(settings.cookies_file)
+        return None
+    if platform is Platform.YOUTUBE:
+        if settings.youtube_cookies_file and settings.youtube_cookies_file.is_file():
+            return str(settings.youtube_cookies_file)
         if settings.cookies_file and settings.cookies_file.is_file():
             return str(settings.cookies_file)
         return None
@@ -133,19 +138,30 @@ def _map_download_failure(platform: Platform, err: Exception, settings: Settings
             raise DownloadError("X rejected the request (auth error)." + _tw_cookie_hint, retryable=False) from err
 
     if platform is Platform.YOUTUBE:
-        if any(x in msg for x in ("confirm", "bot", "sign in", "age", "verify")):
+        _yt_has_cookies = bool(
+            (settings.youtube_cookies_file and settings.youtube_cookies_file.is_file())
+            or (settings.cookies_file and settings.cookies_file.is_file())
+        )
+        _yt_cookie_hint = (
+            " YOUTUBE_COOKIES_FILE is set — cookies may be expired; re-export from your browser."
+            if _yt_has_cookies
+            else (
+                " YouTube blocks automated downloads from cloud servers without authentication. "
+                "Export a Netscape cookies.txt while logged in at youtube.com and set "
+                "YOUTUBE_COOKIES_FILE in your environment."
+            )
+        )
+        if any(x in msg for x in ("members only", "premium", "join")):
             raise DownloadError(
-                "YouTube blocked the download (bot/age check). "
-                "Try again in a moment — retrying with different player clients.",
-                retryable=True,
-            ) from err
-        if any(x in msg for x in ("login", "cookies", "private", "members only", "premium")):
-            raise DownloadError(
-                "This YouTube video requires a login or is members-only. "
-                "Export a Netscape cookies.txt while logged in at youtube.com and set COOKIES_FILE.",
+                "This YouTube video is members-only or requires a premium subscription.",
                 retryable=False,
             ) from err
-        raise DownloadError(f"YouTube download failed: {raw[:400]}", retryable=True) from err
+        if any(x in msg for x in ("private",)):
+            raise DownloadError("This YouTube video is private.", retryable=False) from err
+        raise DownloadError(
+            "YouTube download failed." + _yt_cookie_hint,
+            retryable=False,
+        ) from err
 
     if "private" in msg or "login" in msg or "cookies" in msg:
         raise DownloadError(
@@ -565,14 +581,6 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
             return DownloadResult(path=paths[0], paths=paths, title=title, direct_urls=[], platform=platform)
         logger.info("fxtwitter no videos; falling back to yt-dlp")
 
-    # YouTube: cobalt.tools first — bypasses YouTube's datacenter-IP bot detection.
-    # Fall through to yt-dlp only if cobalt returns nothing (age-restricted, private, etc.).
-    if platform is Platform.YOUTUBE:
-        paths, title = await _cobalt_download(url, out_dir, out_stem)
-        if paths:
-            logger.info("cobalt ok files=%s", len(paths))
-            return DownloadResult(path=paths[0], paths=paths, title=title, direct_urls=[], platform=platform)
-        logger.info("cobalt no video; falling back to yt-dlp")
 
     ydl_opts, _ = _build_ydl_opts(url, out_dir, out_stem, settings)
     candidate_urls = (
