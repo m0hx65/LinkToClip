@@ -382,6 +382,67 @@ def _is_ig_profile_url(url: str) -> bool:
     return bool(_IG_PROFILE_RE.search(url) and not _IG_CONTENT_PATH_RE.search(url))
 
 
+async def _cobalt_download(url: str, out_dir: Path, out_stem: str) -> tuple[list[Path], str | None]:
+    """Download via cobalt.tools API (v11+). Works from datacenter IPs for YouTube, TikTok, Instagram, Twitter."""
+    media_urls: list[str] = []
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.cobalt.tools/",
+                json={"url": url, "videoQuality": "max"},
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0",
+                },
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    logger.info("cobalt.tools HTTP %s for %s", resp.status, url)
+                    return [], None
+                data = await resp.json()
+        status = data.get("status")
+        if status in ("tunnel", "redirect") and data.get("url"):
+            media_urls.append(data["url"])
+        elif status == "picker":
+            for item in data.get("picker") or []:
+                if item.get("url"):
+                    media_urls.append(item["url"])
+        logger.info("cobalt.tools status=%s found=%d URL(s)", status, len(media_urls))
+    except Exception as e:
+        logger.info("cobalt.tools error: %s", e)
+        return [], None
+
+    if not media_urls:
+        return [], None
+
+    paths: list[Path] = []
+    async with aiohttp.ClientSession() as session:
+        for idx, media_url in enumerate(media_urls, 1):
+            ext = "mp4" if ".mp4" in media_url.lower() else "jpg"
+            out_path = out_dir / f"{out_stem}_{idx}.{ext}"
+            try:
+                async with session.get(
+                    media_url,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                    timeout=aiohttp.ClientTimeout(total=300),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.info("cobalt media %s HTTP %s", idx, resp.status)
+                        continue
+                    ct = resp.headers.get("Content-Type", "")
+                    if "image" in ct:
+                        out_path = out_path.with_suffix(".jpg")
+                    with open(out_path, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(8 * 1024 * 1024):
+                            f.write(chunk)
+                if out_path.is_file() and out_path.stat().st_size > 0:
+                    paths.append(out_path)
+            except Exception as e:
+                logger.info("cobalt media %s download error: %s", idx, e)
+    return paths, None
+
+
 async def _story_api_fallback(url: str, out_dir: Path, out_stem: str) -> tuple[list[Path], str | None]:
     """Download Instagram story via third-party APIs — no login needed for public accounts.
 
@@ -428,32 +489,8 @@ async def _story_api_fallback(url: str, out_dir: Path, out_stem: str) -> tuple[l
 
     # --- Attempt 2: cobalt.tools (open-source, supports Instagram) ---
     if not media_urls:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    "https://api.cobalt.tools/api/json",
-                    json={"url": clean_url, "vQuality": "max"},
-                    headers={
-                        "Content-Type": "application/json",
-                        "Accept": "application/json",
-                        "User-Agent": "Mozilla/5.0",
-                    },
-                    timeout=aiohttp.ClientTimeout(total=30),
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        status = data.get("status")
-                        if status in ("stream", "redirect") and data.get("url"):
-                            media_urls.append(data["url"])
-                        elif status == "picker":
-                            for item in data.get("picker", []):
-                                if item.get("url"):
-                                    media_urls.append(item["url"])
-                        logger.info("cobalt.tools status=%s found=%d URL(s)", status, len(media_urls))
-                    else:
-                        logger.info("cobalt.tools HTTP %s", resp.status)
-        except Exception as e:
-            logger.info("cobalt.tools error: %s", e)
+        cobalt_paths, _ = await _cobalt_download(clean_url, out_dir, out_stem + "_s")
+        return cobalt_paths, None
 
     if not media_urls:
         return [], None
@@ -527,6 +564,15 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
             logger.info("fxtwitter ok files=%s", len(paths))
             return DownloadResult(path=paths[0], paths=paths, title=title, direct_urls=[], platform=platform)
         logger.info("fxtwitter no videos; falling back to yt-dlp")
+
+    # YouTube: cobalt.tools first — bypasses YouTube's datacenter-IP bot detection.
+    # Fall through to yt-dlp only if cobalt returns nothing (age-restricted, private, etc.).
+    if platform is Platform.YOUTUBE:
+        paths, title = await _cobalt_download(url, out_dir, out_stem)
+        if paths:
+            logger.info("cobalt ok files=%s", len(paths))
+            return DownloadResult(path=paths[0], paths=paths, title=title, direct_urls=[], platform=platform)
+        logger.info("cobalt no video; falling back to yt-dlp")
 
     ydl_opts, _ = _build_ydl_opts(url, out_dir, out_stem, settings)
     candidate_urls = (
