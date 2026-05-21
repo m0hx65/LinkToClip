@@ -54,7 +54,12 @@ def _run_ffmpeg_sync(
         "-i",
         str(input_path),
         "-vf",
-        "scale='min(1280,iw)':-2",
+        # Cap the longest dimension at 1280, keeping aspect ratio.
+        # The old "scale='min(1280,iw)':-2" only capped width, leaving portrait
+        # videos (e.g. 1080×1920 Instagram Reels) at full height — they were
+        # compressed by bitrate only, causing heavy artifacts. This caps whichever
+        # dimension is longer, so portrait content scales to 720×1280 instead.
+        "scale=min(1280,iw):min(1280,ih):force_original_aspect_ratio=decrease:force_divisible_by=2",
         "-c:v",
         "libx264",
         "-preset",
