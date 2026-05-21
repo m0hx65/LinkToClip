@@ -132,10 +132,24 @@ def _map_download_failure(platform: Platform, err: Exception, settings: Settings
         if any(x in msg for x in ("401", "403", "unauthorized", "login", "cookies", "authenticate")):
             raise DownloadError("X rejected the request (auth error)." + _tw_cookie_hint, retryable=False) from err
 
+    if platform is Platform.YOUTUBE:
+        if any(x in msg for x in ("confirm", "bot", "sign in", "age", "verify")):
+            raise DownloadError(
+                "YouTube blocked the download (bot/age check). "
+                "Try again in a moment — retrying with different player clients.",
+                retryable=True,
+            ) from err
+        if any(x in msg for x in ("login", "cookies", "private", "members only", "premium")):
+            raise DownloadError(
+                "This YouTube video requires a login or is members-only. "
+                "Export a Netscape cookies.txt while logged in at youtube.com and set COOKIES_FILE.",
+                retryable=False,
+            ) from err
+        raise DownloadError(f"YouTube download failed: {raw[:400]}", retryable=True) from err
+
     if "private" in msg or "login" in msg or "cookies" in msg:
         raise DownloadError(
-            "This content is private or requires login. "
-            "If the site is Instagram, add COOKIES_FILE with a browser cookies export.",
+            "This content is private or requires login.",
             retryable=False,
         ) from err
 
