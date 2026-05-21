@@ -5,12 +5,16 @@ from typing import Any
 
 def ytdlp_overrides() -> dict[str, Any]:
     return {
-        # Prefer MP4+M4A (both AAC) so the merge requires no audio transcoding.
-        # Falling back to any bv+ba avoids failures when those formats aren't served.
-        "format": "bv*[ext=mp4]+ba[ext=m4a]/bv*[ext=mp4]+ba/bv*+ba/b",
-        # When audio transcoding is unavoidable (e.g. Opus→AAC), use 192k to avoid degradation.
+        # [vcodec^=avc1] ensures H.264 video — required for iOS playback.
+        # Audio: no [ext=m4a] restriction so yt-dlp picks the highest-quality audio
+        # stream regardless of format (TikTok sometimes has better Opus than M4A).
+        # The merge step always runs (separate bv+ba), so postprocessor_args always apply.
+        "format": "bv*[ext=mp4][vcodec^=avc1]+ba/bv*[ext=mp4]+ba/b[ext=mp4]/b",
+        # Always re-encode audio to stereo 192k AAC on merge:
+        #   -ac 2      → force stereo (TikTok often serves mono tracks)
+        #   -b:a 192k  → high bitrate to avoid lossy-to-lossy degradation
         "postprocessor_args": {
-            "ffmpeg": ["-c:a", "aac", "-b:a", "192k"],
+            "ffmpeg": ["-c:a", "aac", "-b:a", "192k", "-ac", "2"],
         },
         "extractor_args": {
             "tiktok": {},

@@ -5,10 +5,16 @@ from typing import Any
 
 def ytdlp_overrides() -> dict[str, Any]:
     return {
-        # Pick the highest-resolution video stream regardless of codec (VP9/AV1/H.264),
-        # paired with AAC audio. yt-dlp remuxes compatible streams into MP4 via stream-
-        # copy; VP9/AV1 are embedded in the MP4 container without video re-encoding.
-        "format": "bv*+ba[ext=m4a]/bv*+ba/best",
+        # iOS only plays H.264 (avc1) reliably — VP9 and AV1 silently fail.
+        # bv*[ext=mp4][vcodec^=avc1] picks the highest-resolution H.264 YouTube serves
+        # (can be 1080p, 1440p, or 4K depending on the video). Stream-copied into MP4,
+        # no re-encoding. Falls back through progressively broader options.
+        "format": (
+            "bv*[ext=mp4][vcodec^=avc1]+ba[ext=m4a]"  # H.264 + AAC  (ideal, stream-copy both)
+            "/bv*[ext=mp4][vcodec^=avc1]+ba"           # H.264 + any audio (transcode audio if needed)
+            "/bv*[ext=mp4]+ba[ext=m4a]"                # any MP4 video + AAC (H.265 fallback)
+            "/bv*+ba/best"                             # last resort
+        ),
         # When audio transcoding is unavoidable (e.g. Opus→AAC fallback), use 192k.
         # YouTube's default Opus audio is 160k; transcoding at lower bitrate degrades it.
         "postprocessor_args": {
