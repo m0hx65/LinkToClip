@@ -64,6 +64,12 @@ class _YtdlpLogger:
 
 
 def _cookiefile_for_platform(settings: Settings, platform: Platform) -> str | None:
+    if platform is Platform.TIKTOK:
+        if settings.tiktok_cookies_file and settings.tiktok_cookies_file.is_file():
+            return str(settings.tiktok_cookies_file)
+        if settings.cookies_file and settings.cookies_file.is_file():
+            return str(settings.cookies_file)
+        return None
     if platform is Platform.TWITTER:
         if settings.twitter_cookies_file and settings.twitter_cookies_file.is_file():
             return str(settings.twitter_cookies_file)
@@ -162,6 +168,16 @@ def _map_download_failure(platform: Platform, err: Exception, settings: Settings
             "YouTube download failed." + _yt_cookie_hint,
             retryable=False,
         ) from err
+
+    if platform is Platform.TIKTOK:
+        if "private" in msg or "login" in msg or "cookies" in msg:
+            raise DownloadError(
+                "TikTok blocked the download from this server's IP. "
+                "This is common on cloud/datacenter hosts. "
+                "Export a Netscape cookies.txt while logged in at tiktok.com and set "
+                "TIKTOK_COOKIES_FILE (or COOKIES_FILE) in your environment to bypass this.",
+                retryable=False,
+            ) from err
 
     if "private" in msg or "login" in msg or "cookies" in msg:
         raise DownloadError(
@@ -386,6 +402,51 @@ async def _fxtwitter_fallback(url: str, out_dir: Path, out_stem: str) -> tuple[l
     return paths, title
 
 
+async def _tikwm_download(url: str, out_dir: Path, out_stem: str) -> tuple[list[Path], str | None]:
+    """Download TikTok via tikwm.com API — no auth, no cookies, works from datacenter IPs."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://www.tikwm.com/api/",
+                data={"url": url, "count": 12, "cursor": 0, "web": 1, "hd": 1},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    logger.info("tikwm HTTP %s", resp.status)
+                    return [], None
+                data = await resp.json(content_type=None)
+        if data.get("code") != 0:
+            logger.info("tikwm error code=%s msg=%s", data.get("code"), data.get("msg"))
+            return [], None
+        item = data.get("data") or {}
+        title: str | None = item.get("title") or None
+        # Prefer HD play URL, fall back to standard play URL
+        video_url: str | None = item.get("hdplay") or item.get("play") or None
+        if not video_url:
+            logger.info("tikwm no video URL in response")
+            return [], None
+        out_path = out_dir / f"{out_stem}_1.mp4"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                video_url,
+                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.tikwm.com/"},
+                timeout=aiohttp.ClientTimeout(total=300),
+            ) as resp:
+                if resp.status != 200:
+                    logger.info("tikwm video download HTTP %s", resp.status)
+                    return [], None
+                with open(out_path, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(8 * 1024 * 1024):
+                        f.write(chunk)
+        if out_path.is_file() and out_path.stat().st_size > 0:
+            logger.info("tikwm ok title=%r", title)
+            return [out_path], title
+    except Exception as e:
+        logger.info("tikwm error: %s", e)
+    return [], None
+
+
 def _clean_ig_url(url: str) -> str:
     """Strip Instagram share-tracking params (igsh, utm_*) that confuse third-party APIs."""
     p = urlparse(url)
@@ -571,6 +632,20 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
                 "COOKIES_FILE (e.g. in Render → Environment).",
                 retryable=False,
             )
+
+    # TikTok: try no-auth third-party APIs first — both bypass datacenter IP blocking.
+    # cobalt.tools → tikwm.com → yt-dlp (last resort, needs cookies on cloud hosts).
+    if platform is Platform.TIKTOK:
+        paths, title = await _cobalt_download(url, out_dir, out_stem)
+        if paths:
+            logger.info("cobalt.tools TikTok ok files=%d", len(paths))
+            return DownloadResult(path=paths[0], paths=paths, title=title, direct_urls=[], platform=platform)
+        logger.info("cobalt.tools TikTok failed; trying tikwm")
+        paths, title = await _tikwm_download(url, out_dir, out_stem)
+        if paths:
+            logger.info("tikwm TikTok ok files=%d", len(paths))
+            return DownloadResult(path=paths[0], paths=paths, title=title, direct_urls=[], platform=platform)
+        logger.info("tikwm TikTok failed; falling back to yt-dlp")
 
     # Twitter: fxtwitter first — instant on cloud IPs, no auth needed.
     # Fall through to yt-dlp only if fxtwitter has no video (private/deleted/no-media tweet).
