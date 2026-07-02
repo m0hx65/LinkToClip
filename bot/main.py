@@ -13,6 +13,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from bot.handlers.download import router as download_router
 from bot.health_server import start_if_configured
 from bot.middlewares import SettingsMiddleware
+from services import ig_stories
 from utils.config import load_settings
 from utils.logging_setup import setup_logging
 
@@ -42,6 +43,7 @@ async def main() -> None:
     try:
         await dp.start_polling(bot)
     finally:
+        await ig_stories.close_client()
         if http_runner is not None:
             await http_runner.cleanup()
 

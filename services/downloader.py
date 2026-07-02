@@ -7,7 +7,6 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 import yt_dlp
@@ -17,6 +16,7 @@ from platforms import instagram as ig_mod
 from platforms import tiktok as tt_mod
 from platforms import twitter as tw_mod
 from platforms import youtube as yt_mod
+from services import ig_stories
 from utils.config import Settings
 from utils.urltools import normalize_http_url
 
@@ -111,9 +111,9 @@ def _map_download_failure(platform: Platform, err: Exception, settings: Settings
         has = bool(settings.cookies_file and settings.cookies_file.is_file())
         if _IG_STORY_RE.search(url) and "/highlights/" not in url.lower():
             raise DownloadError(
-                "Could not download this story. The third-party fallback (saveig.app) returned "
+                "Could not download this story. The anonymous downloader (saveinsta.to) returned "
                 "nothing and yt-dlp also failed. Stories from private accounts always need cookies; "
-                "for public accounts saveig.app may be temporarily down. "
+                "for public accounts saveinsta.to may be temporarily down. "
                 + (_IG_HELP_HAS_COOKIES if has else _IG_HELP_NO_COOKIES),
                 retryable=False,
             ) from err
@@ -447,13 +447,6 @@ async def _tikwm_download(url: str, out_dir: Path, out_stem: str) -> tuple[list[
     return [], None
 
 
-def _clean_ig_url(url: str) -> str:
-    """Strip Instagram share-tracking params (igsh, utm_*) that confuse third-party APIs."""
-    p = urlparse(url)
-    path = p.path.rstrip("/") + "/"
-    return urlunparse((p.scheme or "https", p.netloc, path, "", "", ""))
-
-
 def _is_ig_profile_url(url: str) -> bool:
     """Return True if url is a bare Instagram profile link with no downloadable content path."""
     return bool(_IG_PROFILE_RE.search(url) and not _IG_CONTENT_PATH_RE.search(url))
@@ -520,86 +513,12 @@ async def _cobalt_download(url: str, out_dir: Path, out_stem: str) -> tuple[list
     return paths, None
 
 
-async def _story_api_fallback(url: str, out_dir: Path, out_stem: str) -> tuple[list[Path], str | None]:
-    """Download Instagram story via third-party APIs — no login needed for public accounts.
-
-    Tries two services in order:
-    1. saveig.app  — general Instagram downloader (posts/reels/stories)
-    2. cobalt.tools — open-source media downloader with Instagram support
-
-    Both use their own backend sessions so callers need no cookies.
-    Falls through gracefully if a service is down or returns no media.
-    """
-    clean_url = _clean_ig_url(url)
-    logger.info("Story fallback clean_url=%s", clean_url)
-    media_urls: list[str] = []
-
-    # --- Attempt 1: saveig.app ---
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://v3.saveig.app/api/ajaxSearch",
-                data={"q": clean_url, "t": "media", "lang": "en"},
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Origin": "https://saveig.app",
-                    "Referer": "https://saveig.app/en",
-                },
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    html = data.get("data", "")
-                    found = list(dict.fromkeys(re.findall(
-                        r'https://[^\s"\'<>]+?\.(?:mp4|jpg|jpeg|png)(?:\?[^\s"\'<>]*)?',
-                        html, re.I,
-                    )))
-                    media_urls.extend(found)
-                    logger.info("saveig.app returned %d media URL(s)", len(found))
-                else:
-                    logger.info("saveig.app HTTP %s", resp.status)
-    except Exception as e:
-        logger.info("saveig.app error: %s", e)
-
-    # --- Attempt 2: cobalt.tools (open-source, supports Instagram) ---
-    if not media_urls:
-        cobalt_paths, _ = await _cobalt_download(clean_url, out_dir, out_stem + "_s")
-        return cobalt_paths, None
-
-    if not media_urls:
-        return [], None
-
-    paths: list[Path] = []
-    async with aiohttp.ClientSession() as session:
-        for idx, media_url in enumerate(media_urls, 1):
-            ext = "mp4" if ".mp4" in media_url.lower() else "jpg"
-            out_path = out_dir / f"{out_stem}_s{idx}.{ext}"
-            try:
-                async with session.get(
-                    media_url,
-                    headers={"User-Agent": "Mozilla/5.0"},
-                    timeout=aiohttp.ClientTimeout(total=120),
-                ) as resp:
-                    if resp.status != 200:
-                        logger.info("Story media %s HTTP %s", idx, resp.status)
-                        continue
-                    with open(out_path, "wb") as f:
-                        async for chunk in resp.content.iter_chunked(8 * 1024 * 1024):
-                            f.write(chunk)
-                if out_path.is_file() and out_path.stat().st_size > 0:
-                    paths.append(out_path)
-            except Exception as e:
-                logger.info("Story media %s download error: %s", idx, e)
-
-    return paths, None
-
-
 async def download_media(url: str, settings: Settings) -> DownloadResult:
     url = normalize_http_url(url)
     platform = detect_platform(url)
+    if platform is Platform.INSTAGRAM:
+        # App share links (instagram.com/s/<base64>) decode to highlight URLs.
+        url = ig_stories.normalize_story_share_url(url)
     if platform is Platform.UNKNOWN:
         raise DownloadError(
             "Unsupported URL. Send a link from Instagram, TikTok, X (Twitter), or YouTube.",
@@ -621,17 +540,30 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
     paths: list[Path] = []
     title: str | None = None
 
-    # Instagram stories require a logged-in session — skip straight to a clear error.
-    # Highlights (/stories/highlights/…) are different and work via yt-dlp without auth.
-    if platform is Platform.INSTAGRAM and _IG_STORY_RE.search(url) and "/highlights/" not in url.lower():
+    # Instagram stories & highlights: saveinsta.to first — anonymous, no cookies
+    # needed for public accounts (Instagram's own endpoints return login_required
+    # for story media). Falls back to yt-dlp, which for stories needs cookies.
+    if platform is Platform.INSTAGRAM and _IG_STORY_RE.search(url):
+        paths, title = await ig_stories.download_story_media(url, out_dir, out_stem)
+        if paths:
+            logger.info("saveinsta.to ok files=%d", len(paths))
+            return DownloadResult(path=paths[0], paths=paths, title=title, direct_urls=[], platform=platform)
+        logger.info("saveinsta.to returned nothing for %s", url)
+        # Without cookies, yt-dlp cannot download stories (login_required) —
+        # skip the doomed attempt and give a clear error. Highlights sometimes
+        # work anonymously via yt-dlp, so those fall through.
+        is_story = "/highlights/" not in url.lower()
         has_cookies = bool(settings.cookies_file and settings.cookies_file.is_file())
-        if not has_cookies:
+        if is_story and not has_cookies:
             raise DownloadError(
-                "Instagram story downloading requires cookies. "
-                "Export a Netscape cookies.txt while logged in at instagram.com and set "
-                "COOKIES_FILE (e.g. in Render → Environment).",
+                "Could not download this story. The anonymous downloader (saveinsta.to) "
+                "returned nothing — the account may be private, the story may have expired, "
+                "or the service is temporarily down. Stories from private accounts need "
+                "cookies: export a Netscape cookies.txt while logged in at instagram.com "
+                "and set COOKIES_FILE (e.g. in Render → Environment).",
                 retryable=False,
             )
+        logger.info("Falling back to yt-dlp for %s", url)
 
     # TikTok: try no-auth third-party APIs first — both bypass datacenter IP blocking.
     # cobalt.tools → tikwm.com → yt-dlp (last resort, needs cookies on cloud hosts).
