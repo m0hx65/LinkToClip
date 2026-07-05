@@ -18,7 +18,7 @@ A Telegram bot that downloads videos and photos from Instagram, TikTok, X (Twitt
 
 ## ✨ Features
 
-- **Instagram** — reels, posts, photo carousels, **stories & highlights** (anonymous, no login needed for public accounts)
+- **Instagram** — reels, posts, photo carousels, **stories & highlights** — all served anonymously first (no login or cookies needed for public content, even from cloud IPs)
 - **TikTok** — works from cloud/datacenter IPs without cookies via a cookie-free fallback chain
 - **X / Twitter** — including **multi-video tweets**; fast path through the fxtwitter API
 - **YouTube** — picks the highest-resolution H.264 stream so videos play everywhere, including iOS
@@ -35,10 +35,10 @@ Each platform routes through its fastest source first and degrades gracefully to
 ```mermaid
 flowchart LR
     A[Link received] --> B{Platform?}
-    B -- "IG story / highlight" --> S["saveinsta.to (anonymous)"]
+    B -- "Instagram (all types)" --> S["saveinsta.to (anonymous)"]
     B -- "TikTok" --> C1[cobalt.tools]
     B -- "X / Twitter" --> FX[fxtwitter API]
-    B -- "IG post / reel · YouTube" --> Y[yt-dlp]
+    B -- "YouTube" --> Y[yt-dlp]
     C1 -. fallback .-> C2[tikwm.com]
     S -. fallback .-> Y
     C2 -. fallback .-> Y
@@ -130,7 +130,7 @@ Same recipe: provide `BOT_TOKEN`, prefer the Docker image (ffmpeg included), and
 
 - **Memory** — downloads stream to disk in 1 MB chunks and yt-dlp fetches at most 4 fragments at a time. On free/small tiers keep `MAX_CONCURRENT_DOWNLOADS=1` and `ENABLE_COMPRESSION=false`.
 - **Disk** — partial files from failed downloads are swept automatically after 2 hours; no cron needed.
-- **Instagram** — datacenter IPs are frequently challenged. Stories/highlights work anonymously, but posts/reels are most reliable with a fresh `COOKIES_FILE` export.
+- **Instagram** — all content types route through the anonymous saveinsta.to downloader first, so public posts/reels/stories work from datacenter IPs without cookies. `COOKIES_FILE` only matters for private-account content via the yt-dlp fallback.
 - **yt-dlp** — platforms change constantly; if extractions start failing, upgrade `yt-dlp` first (`pip install -U yt-dlp`).
 
 ---
@@ -140,8 +140,7 @@ Same recipe: provide `BOT_TOKEN`, prefer the Docker image (ffmpeg included), and
 | Symptom | Likely cause | What to try |
 |---------|--------------|-------------|
 | Exit code **137** / "Killed" | Out of memory | Keep concurrency at 1, disable compression, or upsize the instance. |
-| Instagram posts always fail on the server | IP challenge / session | Set `COOKIES_FILE` from a logged-in browser; verify `TEMP_DIR` is writable. |
-| Stories fail but posts work | saveinsta.to hiccup or private account | Public-account stories need no cookies — retry later. Private accounts always need `COOKIES_FILE`. |
+| Instagram posts always fail on the server | saveinsta.to hiccup or private account | Public content needs no cookies — retry in a minute. Private accounts always need `COOKIES_FILE`; also verify `TEMP_DIR` is writable. |
 | "No video could be found" (X) | Tweet has no video | Expected for text/photo-only posts. |
 | TikTok fails without cookies | All three sources blocked | Rare; set `TIKTOK_COOKIES_FILE` as a last resort. |
 | `TelegramConflictError` on startup | Two pollers on one token | Stop the duplicate process (local run vs. deployed instance). |

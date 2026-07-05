@@ -26,7 +26,7 @@ _IG_STORY_RE = re.compile(r"instagram\.com/stories/", re.I)
 # Matches a bare profile URL — instagram.com/username or instagram.com/username?igsh=...
 # Used to give a clear "not downloadable" error before wasting a download attempt.
 _IG_PROFILE_RE = re.compile(r"instagram\.com/([^/?#]+)/?(?:\?|#|$)", re.I)
-_IG_CONTENT_PATH_RE = re.compile(r"instagram\.com/(?:p|reel|tv|stories|reels)/", re.I)
+_IG_CONTENT_PATH_RE = re.compile(r"instagram\.com/(?:p|reel|tv|stories|reels|share)/", re.I)
 _TW_STATUS_RE = re.compile(
     r"^(?:https?://)?(?:www\.)?(?:x\.com|twitter\.com)/(?:i/(?:web/)?status|(?P<user>[^/?#]+)/status)/(?P<id>\d+)(?:[/?#].*)?$",
     re.I,
@@ -200,7 +200,9 @@ def _map_download_failure(platform: Platform, err: Exception, settings: Settings
                 retryable=False,
             ) from err
         raise DownloadError(
-            "Instagram did not return this content to the server. "
+            "Could not download this post. Both the anonymous downloader (saveinsta.to) "
+            "and the direct fetch failed — the account may be private, or the services "
+            "are temporarily rate-limited. This usually resolves on retry. "
             + (_IG_HELP_HAS_COOKIES if has else _IG_HELP_NO_COOKIES),
             retryable=True,
         ) from err
@@ -572,6 +574,9 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
     if platform is Platform.INSTAGRAM:
         # App share links (instagram.com/s/<base64>) decode to highlight URLs.
         url = ig_stories.normalize_story_share_url(url)
+        # instagram.com/share/... links are opaque server-side redirects;
+        # resolve them to the real post/reel URL so the chain below can run.
+        url = await ig_stories.resolve_share_url(url)
     if platform is Platform.UNKNOWN:
         raise DownloadError(
             "Unsupported URL. Send a link from Instagram, TikTok, X (Twitter), or YouTube.",
@@ -618,6 +623,16 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
                 retryable=False,
             )
         logger.info("Falling back to yt-dlp for %s", url)
+
+    # Instagram posts/reels/carousels: saveinsta.to first — anonymous, works
+    # from datacenter IPs where Instagram blocks cookieless yt-dlp requests.
+    # Falls back to yt-dlp, which succeeds with COOKIES_FILE or friendly IPs.
+    if platform is Platform.INSTAGRAM and not _IG_STORY_RE.search(url):
+        paths, title = await ig_stories.download_post_media(url, out_dir, out_stem)
+        if paths:
+            logger.info("saveinsta.to post ok files=%d", len(paths))
+            return DownloadResult(path=paths[0], paths=paths, title=title, direct_urls=[], platform=platform)
+        logger.info("saveinsta.to returned nothing for post %s; falling back to yt-dlp", url)
 
     # TikTok: try no-auth third-party APIs first — both bypass datacenter IP blocking.
     # cobalt.tools → tikwm.com → yt-dlp (last resort, needs cookies on cloud hosts).

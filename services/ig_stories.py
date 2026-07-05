@@ -1,8 +1,9 @@
-"""Login-free Instagram story & highlight downloader (saveinsta.to).
+"""Login-free Instagram media downloader (saveinsta.to).
 
-Same logic as the_watcher_V3.0 stories client: 100% anonymous — no Instagram
-login, cookie, or session. Instagram's own endpoints return `login_required`
-for story media, so we drive saveinsta.to's public token flow the same way its
+Covers stories, highlights, posts, reels, and photo carousels. Same logic as
+the_watcher_V3.0 stories client: 100% anonymous — no Instagram login, cookie,
+or session. Instagram blocks its own endpoints for anonymous/datacenter
+clients, so we drive saveinsta.to's public token flow the same way its
 web UI does:
 
     1. GET  https://saveinsta.to/en/highlights        -> page carries k_exp / k_token
@@ -29,6 +30,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from curl_cffi.requests import AsyncSession
 
@@ -60,6 +62,13 @@ _STORY_URL_RE = re.compile(
 _HIGHLIGHT_URL_RE = re.compile(r"instagram\.com/stories/highlights/(?P<id>\d+)", re.I)
 # App share links: instagram.com/s/<base64("highlight:<id>")>
 _SHARE_URL_RE = re.compile(r"instagram\.com/s/(?P<blob>[A-Za-z0-9_-]+={0,2})", re.I)
+# Posts, reels, and IGTV: instagram.com/{p|reel|reels|tv}/<shortcode>
+_POST_URL_RE = re.compile(
+    r"instagram\.com/(?P<kind>p|reel|reels|tv)/(?P<code>[A-Za-z0-9_-]+)", re.I
+)
+# Opaque app share links (instagram.com/share/...) — server-side redirects
+# to the real post/reel URL; must be resolved before download.
+_SHARE_REDIRECT_RE = re.compile(r"instagram\.com/share/", re.I)
 
 
 @dataclass
@@ -89,6 +98,20 @@ def normalize_story_share_url(url: str) -> str:
         if hid.isdigit():
             return f"https://www.instagram.com/stories/highlights/{hid}/"
     return url
+
+
+def canonical_post_url(url: str) -> str | None:
+    """Canonical post/reel URL with tracking params (igsh, utm_*) stripped.
+
+    Returns None when the URL doesn't point at a post, reel, or IGTV video.
+    """
+    m = _POST_URL_RE.search(url)
+    if not m:
+        return None
+    kind = m.group("kind").lower()
+    if kind == "reels":
+        kind = "reel"
+    return f"https://www.instagram.com/{kind}/{m.group('code')}/"
 
 
 class StoriesClient:
@@ -128,6 +151,20 @@ class StoriesClient:
             return dest
         except Exception as e:
             logger.info("saveinsta media pk=%s download error: %s", item.pk, e)
+            return None
+
+    async def resolve_redirect(self, url: str) -> str | None:
+        """Follow redirects and return the final URL (None on failure).
+
+        Uses the Chrome-impersonating session, which Instagram redirects
+        normally even for clients it would block on content endpoints.
+        """
+        try:
+            resp = await self._session.get(url)
+            final = str(resp.url or "")
+            return final or None
+        except Exception as e:
+            logger.info("redirect resolve failed for %s: %s", url, e)
             return None
 
     # --------------------------------------------------------------- internal
@@ -300,6 +337,26 @@ async def close_client() -> None:
         _client = None
 
 
+async def _download_items(
+    client: StoriesClient, items: list[StoryItem], out_dir: Path, out_stem: str
+) -> list[Path]:
+    """Download items concurrently (highlights/carousels can hold dozens); the
+    semaphore keeps us polite to the CDN and bounds memory. gather preserves
+    order, so the _<idx> numbering still matches the source sequence."""
+    sem = asyncio.Semaphore(4)
+
+    async def _bounded_download(item: StoryItem, dest: Path) -> Path | None:
+        async with sem:
+            return await client.download(item, dest)
+
+    tasks = []
+    for idx, item in enumerate(items, 1):
+        ext = ".mp4" if item.media_type == "video" else ".jpg"
+        tasks.append(_bounded_download(item, out_dir / f"{out_stem}_{idx}{ext}"))
+    results = await asyncio.gather(*tasks)
+    return [p for p in results if p and p.is_file() and p.stat().st_size > 0]
+
+
 async def download_story_media(
     url: str, out_dir: Path, out_stem: str
 ) -> tuple[list[Path], str | None]:
@@ -328,19 +385,49 @@ async def download_story_media(
         if exact:
             items = exact
 
-    # Download items concurrently (highlights can hold dozens); the semaphore
-    # keeps us polite to the CDN and bounds memory. gather preserves order,
-    # so the _<idx> numbering still matches the story sequence.
-    sem = asyncio.Semaphore(4)
-
-    async def _bounded_download(item: StoryItem, dest: Path) -> Path | None:
-        async with sem:
-            return await client.download(item, dest)
-
-    tasks = []
-    for idx, item in enumerate(items, 1):
-        ext = ".mp4" if item.media_type == "video" else ".jpg"
-        tasks.append(_bounded_download(item, out_dir / f"{out_stem}_{idx}{ext}"))
-    results = await asyncio.gather(*tasks)
-    paths = [p for p in results if p and p.is_file() and p.stat().st_size > 0]
+    paths = await _download_items(client, items, out_dir, out_stem)
     return paths, None
+
+
+async def download_post_media(
+    url: str, out_dir: Path, out_stem: str
+) -> tuple[list[Path], str | None]:
+    """Download an Instagram post/reel/carousel via saveinsta.to (login-free).
+
+    Works for public content from datacenter IPs where Instagram blocks
+    anonymous yt-dlp requests. Returns ([], None) on any failure so callers
+    can fall back to yt-dlp.
+    """
+    target = canonical_post_url(url)
+    if not target:
+        return [], None
+    client = get_client()
+    items = await client.fetch_items(target)
+    paths = await _download_items(client, items, out_dir, out_stem)
+    return paths, None
+
+
+async def resolve_share_url(url: str) -> str:
+    """Resolve opaque instagram.com/share/... links to the real post URL.
+
+    Share links are server-side redirects; anonymous clients sometimes land on
+    the login page instead, which still carries the destination in ?next=.
+    Returns the original URL on any failure so downloads can still be tried.
+    """
+    if not _SHARE_REDIRECT_RE.search(url):
+        return url
+    final = await get_client().resolve_redirect(url)
+    if not final:
+        return url
+    if "/accounts/login" in final:
+        nxt = (parse_qs(urlparse(final).query).get("next") or [""])[0]
+        if nxt.startswith("/"):
+            final = "https://www.instagram.com" + nxt
+        elif nxt.startswith("http"):
+            final = nxt
+        else:
+            return url
+    if _SHARE_REDIRECT_RE.search(final):
+        return url
+    logger.info("Resolved IG share link to %s", final.split("?", 1)[0])
+    return final
