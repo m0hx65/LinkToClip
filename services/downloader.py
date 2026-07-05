@@ -480,6 +480,11 @@ async def _fxtwitter_fallback(url: str, out_dir: Path, out_stem: str) -> tuple[l
     return [p for p in results if p], title
 
 
+def _tikwm_abs(u: str) -> str:
+    """tikwm returns proxy paths relative to its own host (e.g. /video/media/…)."""
+    return "https://www.tikwm.com" + u if u.startswith("/") else u
+
+
 async def _tikwm_download(url: str, out_dir: Path, out_stem: str) -> tuple[list[Path], str | None]:
     """Download TikTok via tikwm.com API — no auth, no cookies, works from datacenter IPs."""
     try:
@@ -501,15 +506,32 @@ async def _tikwm_download(url: str, out_dir: Path, out_stem: str) -> tuple[list[
         return [], None
     item = data.get("data") or {}
     title: str | None = item.get("title") or None
+    headers = {"Referer": "https://www.tikwm.com/"}
+
+    # Photo-mode posts carry the slides in `images`; their play/hdplay URLs
+    # are only the soundtrack MP3, so download the images instead.
+    images = [i for i in (item.get("images") or []) if isinstance(i, str)]
+    if images:
+        results = await asyncio.gather(
+            *(
+                _fetch_to_file(_tikwm_abs(img), out_dir / f"{out_stem}_{idx}.jpg", headers=headers)
+                for idx, img in enumerate(images, 1)
+            )
+        )
+        paths = [p for p in results if p]
+        if paths:
+            logger.info("tikwm ok photos=%d title=%r", len(paths), title)
+        return paths, title if paths else None
+
     # Prefer HD play URL, fall back to standard play URL
     video_url: str | None = item.get("hdplay") or item.get("play") or None
     if not video_url:
         logger.info("tikwm no video URL in response")
         return [], None
     out_path = await _fetch_to_file(
-        video_url,
+        _tikwm_abs(video_url),
         out_dir / f"{out_stem}_1.mp4",
-        headers={"Referer": "https://www.tikwm.com/"},
+        headers=headers,
     )
     if out_path:
         logger.info("tikwm ok title=%r", title)
@@ -520,52 +542,6 @@ async def _tikwm_download(url: str, out_dir: Path, out_stem: str) -> tuple[list[
 def _is_ig_profile_url(url: str) -> bool:
     """Return True if url is a bare Instagram profile link with no downloadable content path."""
     return bool(_IG_PROFILE_RE.search(url) and not _IG_CONTENT_PATH_RE.search(url))
-
-
-async def _cobalt_download(url: str, out_dir: Path, out_stem: str) -> tuple[list[Path], str | None]:
-    """Download via cobalt.tools API (v11+). Works from datacenter IPs for YouTube, TikTok, Instagram, Twitter."""
-    media_urls: list[str] = []
-    try:
-        session = _get_http_session()
-        async with session.post(
-            "https://api.cobalt.tools/",
-            json={"url": url, "videoQuality": "max"},
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-            timeout=_API_TIMEOUT,
-        ) as resp:
-            if resp.status != 200:
-                logger.info("cobalt.tools HTTP %s for %s", resp.status, url)
-                return [], None
-            data = await resp.json()
-        status = data.get("status")
-        if status in ("tunnel", "redirect") and data.get("url"):
-            media_urls.append(data["url"])
-        elif status == "picker":
-            for item in data.get("picker") or []:
-                if item.get("url"):
-                    media_urls.append(item["url"])
-        logger.info("cobalt.tools status=%s found=%d URL(s)", status, len(media_urls))
-    except Exception as e:
-        logger.info("cobalt.tools error: %s", e)
-        return [], None
-
-    if not media_urls:
-        return [], None
-
-    def _guessed_path(idx: int, media_url: str) -> Path:
-        ext = "mp4" if ".mp4" in media_url.lower() else "jpg"
-        return out_dir / f"{out_stem}_{idx}.{ext}"
-
-    results = await asyncio.gather(
-        *(
-            _fetch_to_file(media_url, _guessed_path(idx, media_url))
-            for idx, media_url in enumerate(media_urls, 1)
-        )
-    )
-    return [p for p in results if p], None
 
 
 async def download_media(url: str, settings: Settings) -> DownloadResult:
@@ -634,14 +610,11 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
             return DownloadResult(path=paths[0], paths=paths, title=title, direct_urls=[], platform=platform)
         logger.info("saveinsta.to returned nothing for post %s; falling back to yt-dlp", url)
 
-    # TikTok: try no-auth third-party APIs first — both bypass datacenter IP blocking.
-    # cobalt.tools → tikwm.com → yt-dlp (last resort, needs cookies on cloud hosts).
+    # TikTok: tikwm.com first — no auth, no cookies, bypasses datacenter IP
+    # blocking, and handles photo-mode posts. Falls back to yt-dlp (last
+    # resort, needs cookies on cloud hosts). cobalt.tools was dropped from
+    # the chain: its API now rejects all anonymous requests (JWT required).
     if platform is Platform.TIKTOK:
-        paths, title = await _cobalt_download(url, out_dir, out_stem)
-        if paths:
-            logger.info("cobalt.tools TikTok ok files=%d", len(paths))
-            return DownloadResult(path=paths[0], paths=paths, title=title, direct_urls=[], platform=platform)
-        logger.info("cobalt.tools TikTok failed; trying tikwm")
         paths, title = await _tikwm_download(url, out_dir, out_stem)
         if paths:
             logger.info("tikwm TikTok ok files=%d", len(paths))
