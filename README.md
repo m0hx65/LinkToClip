@@ -1,91 +1,62 @@
-# LinkToClip
+<div align="center">
 
-**LinkToClip** is a Telegram bot that downloads public videos from supported social platforms and sends them directly in chat. It uses [aiogram](https://docs.aiogram.dev/) for the Telegram layer and [yt-dlp](https://github.com/yt-dlp/yt-dlp) for extraction, with optional [ffmpeg](https://ffmpeg.org/) compression when files exceed Telegram’s upload limit.
+# 🎬 LinkToClip
 
----
+**Drop a link, get the video.**
+A Telegram bot that downloads videos and photos from Instagram, TikTok, X (Twitter), and YouTube — straight into your chat.
 
-## Table of contents
+[![CI](https://github.com/m0hx65/LinkToClip/actions/workflows/ci.yml/badge.svg)](https://github.com/m0hx65/LinkToClip/actions/workflows/ci.yml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
+[![aiogram 3](https://img.shields.io/badge/aiogram-3.x-2CA5E0?logo=telegram&logoColor=white)](https://docs.aiogram.dev/)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![Docker Ready](https://img.shields.io/badge/docker-ready-2496ED?logo=docker&logoColor=white)](Dockerfile)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-- [What it does](#what-it-does)
-- [Supported platforms](#supported-platforms)
-- [How it works](#how-it-works)
-- [Tech stack](#tech-stack)
-- [Requirements](#requirements)
-- [Quick start (local)](#quick-start-local)
-- [Configuration](#configuration)
-- [Deployment](#deployment)
-- [Health check (Render & similar)](#health-check-render--similar)
-- [Operations & tuning](#operations--tuning)
-- [Troubleshooting](#troubleshooting)
-- [Repository layout](#repository-layout)
-- [Limitations](#limitations)
-- [Legal & disclaimer](#legal--disclaimer)
-- [Contributing](#contributing)
-- [License](#license)
+</div>
 
 ---
 
-## What it does
+## ✨ Features
 
-1. User sends a message containing a link (Instagram reel/post, TikTok, X/Twitter, or YouTube).
-2. The bot detects the platform, downloads the best available video with **yt-dlp**, and replies with the video in Telegram.
-3. If the file is **too large** for the Bot API (~50 MB), the bot can optionally **re-encode** with ffmpeg to shrink it, or fall back to **direct URLs** from metadata when possible.
-4. On small cloud instances, the code **limits concurrent downloads** and avoids extra work by default to reduce memory spikes.
-
----
-
-## Supported platforms
-
-| Platform | Notes |
-|----------|--------|
-| **Instagram** | Reels, posts, and typical share URLs. Cloud/datacenter IPs often need a browser **`cookies.txt`** (`COOKIES_FILE`) even for public content. |
-| **TikTok** | Standard `tiktok.com` / `vm.tiktok.com` style links. |
-| **X (Twitter)** | `twitter.com` and `x.com` status URLs. Text-only posts or tweets without video will fail with a clear error. |
-| **YouTube** | Regular watch URLs and short `youtu.be` links. |
-
-Anything else is rejected with an “unsupported URL” style message.
+- **Instagram** — reels, posts, photo carousels, **stories & highlights** (anonymous, no login needed for public accounts)
+- **TikTok** — works from cloud/datacenter IPs without cookies via a cookie-free fallback chain
+- **X / Twitter** — including **multi-video tweets**; fast path through the fxtwitter API
+- **YouTube** — picks the highest-resolution H.264 stream so videos play everywhere, including iOS
+- **Big files handled** — optional ffmpeg compression, and automatic **splitting into parts** when a video exceeds Telegram's ~50 MB Bot API limit
+- **Resilient by design** — every platform has a chain of independent download sources; if one service is down, the next takes over automatically
+- **Built for small hosts** — bounded concurrency, streaming downloads, and stale-file cleanup keep memory and disk usage flat on free-tier instances
 
 ---
 
-## How it works
+## 🧭 How it works
+
+Each platform routes through its fastest source first and degrades gracefully to yt-dlp:
 
 ```mermaid
 flowchart LR
-  A[User message with URL] --> B[URL extraction & platform detect]
-  B --> C[yt-dlp download to TEMP_DIR]
-  C --> D{Size OK for Telegram?}
-  D -->|Yes| E[Send video]
-  D -->|No + compression enabled| F[ffmpeg re-encode]
-  D -->|No + no compression| G[Send direct URLs if available]
-  F --> D
+    A[Link received] --> B{Platform?}
+    B -- "IG story / highlight" --> S["saveinsta.to (anonymous)"]
+    B -- "TikTok" --> C1[cobalt.tools]
+    B -- "X / Twitter" --> FX[fxtwitter API]
+    B -- "IG post / reel · YouTube" --> Y[yt-dlp]
+    C1 -. fallback .-> C2[tikwm.com]
+    S -. fallback .-> Y
+    C2 -. fallback .-> Y
+    FX -. fallback .-> Y
+    S & C1 & C2 & FX & Y --> SZ{"fits 50 MB?"}
+    SZ -- "yes" --> OK[Sent to chat]
+    SZ -- "no" --> CP["compress (optional) → split into parts"] --> OK
 ```
 
-- **Long polling**: Telegram updates are received via `start_polling` (no webhook required).
-- **Optional HTTP**: On hosts like Render, a tiny **health server** can listen on `PORT` so the platform sees the process as healthy; Telegram still uses polling, not that HTTP URL.
+- **Long polling** — updates arrive via `getUpdates`; no webhook or public URL required.
+- **Health endpoint** — on hosts like Render, a tiny HTTP server answers `GET /` → `ok` so the platform sees the process as healthy.
+- **Performance** — one pooled HTTP session with DNS caching across all downloaders, HLS/DASH fragments fetched 4-wide, carousel/story items downloaded concurrently, and uploads run outside the download queue slot so the next request starts immediately.
 
 ---
 
-## Tech stack
+## 🚀 Quick start
 
-| Piece | Role |
-|-------|------|
-| Python 3.11+ | Runtime |
-| aiogram 3 | Telegram Bot API |
-| yt-dlp | Video extraction / download |
-| aiohttp | Health HTTP server (when `PORT` or `RENDER` is set) |
-| ffmpeg / ffprobe | Optional compression (when `ENABLE_COMPRESSION=true`) |
-
----
-
-## Requirements
-
-- **Python** 3.11 or newer  
-- **Telegram bot token** from [@BotFather](https://t.me/BotFather)  
-- **ffmpeg** and **ffprobe** on `PATH` if you enable compression (`ENABLE_COMPRESSION=true`). The included **Dockerfile** installs ffmpeg for production-like runs.
-
----
-
-## Quick start (local)
+### Local
 
 ```bash
 git clone https://github.com/m0hx65/LinkToClip.git
@@ -96,40 +67,14 @@ python -m venv .venv
 # Linux/macOS: source .venv/bin/activate
 
 pip install -r requirements.txt
-```
 
-Install ffmpeg on your OS if you plan to use compression (optional locally).
+cp .env.example .env      # Windows: copy .env.example .env
+# edit .env → set BOT_TOKEN (get one from @BotFather)
 
-```bash
-copy .env.example .env   # or: cp .env.example .env
-# Edit .env: set BOT_TOKEN
 python -m bot.main
 ```
 
-For PaaS deployment, set `TEMP_DIR=/tmp` when the platform recommends it, and read [Configuration](#configuration) and [Operations & tuning](#operations--tuning).
-
----
-
-## Configuration
-
-Copy `.env.example` to `.env` and set variables as needed.
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `BOT_TOKEN` | **Yes** | — | Telegram bot token from BotFather. |
-| `LOG_LEVEL` | No | `INFO` | Logging verbosity. |
-| `TEMP_DIR` | No | `./data/temp` | Directory for temporary downloads. Use `/tmp` on many cloud hosts. |
-| `TELEGRAM_MAX_FILE_BYTES` | No | ~49 MB | Max file size to upload via Bot API (stay under the ~50 MB limit). |
-| `COMPRESS_TARGET_BYTES` | No | ~46 MB | Target size when compression runs. |
-| `ENABLE_COMPRESSION` | No | `false` | Set `true` to allow ffmpeg shrinking for oversized files. Uses extra CPU/RAM—keep `false` on small instances. |
-| `MAX_CONCURRENT_DOWNLOADS` | No | `1` | Cap parallel downloads; use `1` on low-memory hosts. |
-| `COOKIES_FILE` | No | — | Path to Netscape `cookies.txt` from a logged-in **instagram.com** session; often needed on cloud IPs. |
-| `PORT` | No | — | If set, the bot starts a minimal HTTP server on `0.0.0.0:$PORT` with `GET /` → `ok` (health check). |
-| `RENDER` | No | — | If set (e.g. on Render), same as needing a listener—health server starts if `PORT` is unset (defaults to `10000` in code). |
-
----
-
-## Deployment
+ffmpeg is only needed if you enable compression or hit files large enough to split.
 
 ### Docker
 
@@ -138,86 +83,111 @@ docker build -t linktoclip .
 docker run --env-file .env linktoclip
 ```
 
-The image is based on `python:3.12-slim` and installs **ffmpeg** for optional compression.
+The image is based on `python:3.12-slim` and ships with ffmpeg included.
+
+---
+
+## ⚙️ Configuration
+
+All configuration is via environment variables (or a local `.env` file — see [`.env.example`](.env.example)).
+
+| Variable | Required | Default | Description |
+|----------|:--------:|---------|-------------|
+| `BOT_TOKEN` | ✅ | — | Telegram bot token from [@BotFather](https://t.me/BotFather). |
+| `LOG_LEVEL` | | `INFO` | Logging verbosity. |
+| `TEMP_DIR` | | `./data/temp` | Scratch directory for downloads. Use `/tmp` on most cloud hosts. |
+| `TELEGRAM_MAX_FILE_BYTES` | | ~49 MB | Upload ceiling; stays under the Bot API's ~50 MB limit. |
+| `COMPRESS_TARGET_BYTES` | | ~46 MB | Target size when compression runs. |
+| `ENABLE_COMPRESSION` | | `false` | Allow ffmpeg re-encoding of oversized videos. CPU/RAM heavy — keep `false` on small instances (splitting still works). |
+| `MAX_CONCURRENT_DOWNLOADS` | | `1` | Parallel download slots. `1` is the safe choice on low-memory hosts; uploads don't count against it. |
+| `COOKIES_FILE` | | — | Netscape `cookies.txt` used as the shared fallback for all platforms. Most useful for Instagram posts/reels on cloud IPs. |
+| `TIKTOK_COOKIES_FILE` | | — | TikTok-specific cookies; overrides `COOKIES_FILE` for TikTok. Rarely needed thanks to the cookie-free chain. |
+| `TWITTER_COOKIES_FILE` | | — | X/Twitter-specific cookies; needed for age-gated or restricted tweets. |
+| `YOUTUBE_COOKIES_FILE` | | — | YouTube-specific cookies; helps when YouTube blocks datacenter IPs. |
+| `PORT` | | — | If set, serves `GET /` → `ok` on `0.0.0.0:$PORT` for health checks. |
+| `RENDER` | | — | Set automatically by Render; starts the health server (default port `10000`) even without `PORT`. |
+
+---
+
+## ☁️ Deployment
 
 ### Render
 
-1. Connect this GitHub repository.  
-2. Use the **Dockerfile** (recommended) or match the stack manually.  
-3. **Start command:** `python -m bot.main`  
-4. Set **`BOT_TOKEN`**. For a **Web Service**, set **`PORT`** (Render injects it) or rely on **`RENDER`** so the health server binds correctly.  
-5. Optional: `TEMP_DIR=/tmp`, `MAX_CONCURRENT_DOWNLOADS=1`, `ENABLE_COMPRESSION=false`, and `COOKIES_FILE` for Instagram reliability.
+1. Connect this repository and choose the **Docker** runtime.
+2. Set `BOT_TOKEN` in the environment.
+3. For a **Web Service**, Render injects `PORT` and the health server binds automatically; for a **Background Worker**, use the included [`render.yaml`](render.yaml) Blueprint.
+4. Recommended: `TEMP_DIR=/tmp`. Add `COOKIES_FILE` if Instagram posts/reels fail from Render's IPs.
 
-A sample Blueprint is in [`render.yaml`](render.yaml) (worker-oriented; adjust service type to match your plan).
+> ⚠️ Run **one** process per `BOT_TOKEN`. A second poller (e.g. a local run alongside the deployed bot) causes `TelegramConflictError`.
 
 ### Railway / other hosts
 
-Same idea: provide `BOT_TOKEN`, use Docker if you need ffmpeg without manual buildpack setup, and set `TEMP_DIR` to the platform’s ephemeral disk path when documented.
+Same recipe: provide `BOT_TOKEN`, prefer the Docker image (ffmpeg included), and point `TEMP_DIR` at the platform's ephemeral disk.
 
 ---
 
-## Health check (Render & similar)
+## 🔧 Operations & tuning
 
-When `PORT` or `RENDER` is set, the app serves **`GET /`** with body **`ok`** on `0.0.0.0` and the chosen port. That satisfies typical HTTP health checks. **Telegram does not call this URL**; the bot still uses **long polling**.
-
----
-
-## Operations & tuning
-
-- **Memory**: Video download + yt-dlp can spike RAM. Keep **`MAX_CONCURRENT_DOWNLOADS=1`** and **`ENABLE_COMPRESSION=false`** on free/small tiers unless you accept occasional OOM restarts.  
-- **Instagram**: Datacenter IPs are often blocked or throttled; **`COOKIES_FILE`** is the most reliable fix for public reels.  
-- **yt-dlp**: Sites change frequently; pin or periodically upgrade `yt-dlp` in `requirements.txt` if extractions start failing after platform updates.
+- **Memory** — downloads stream to disk in 1 MB chunks and yt-dlp fetches at most 4 fragments at a time. On free/small tiers keep `MAX_CONCURRENT_DOWNLOADS=1` and `ENABLE_COMPRESSION=false`.
+- **Disk** — partial files from failed downloads are swept automatically after 2 hours; no cron needed.
+- **Instagram** — datacenter IPs are frequently challenged. Stories/highlights work anonymously, but posts/reels are most reliable with a fresh `COOKIES_FILE` export.
+- **yt-dlp** — platforms change constantly; if extractions start failing, upgrade `yt-dlp` first (`pip install -U yt-dlp`).
 
 ---
 
-## Troubleshooting
+## 🩺 Troubleshooting
 
 | Symptom | Likely cause | What to try |
-|---------|----------------|-------------|
-| Process exits with code **137** / “Killed” | Out-of-memory | Lower concurrency, disable compression, smaller instance or fewer parallel users. |
-| Instagram always fails on the server | IP / session | Set **`COOKIES_FILE`**, ensure **`TEMP_DIR`** is writable. |
-| “No video could be found” (X/Twitter) | Tweet has no video | Normal for text-only or photo-only posts. |
-| Stuck on “Downloading…” | Long extract or crash | Check host logs; verify memory and `yt-dlp` version. |
-| Video odd on iPhone, fine on Android | Codec / container | Instagram format selection prefers H.264 MP4; some edge cases may still need client-side playback testing. |
+|---------|--------------|-------------|
+| Exit code **137** / "Killed" | Out of memory | Keep concurrency at 1, disable compression, or upsize the instance. |
+| Instagram posts always fail on the server | IP challenge / session | Set `COOKIES_FILE` from a logged-in browser; verify `TEMP_DIR` is writable. |
+| Stories fail but posts work | saveinsta.to hiccup or private account | Public-account stories need no cookies — retry later. Private accounts always need `COOKIES_FILE`. |
+| "No video could be found" (X) | Tweet has no video | Expected for text/photo-only posts. |
+| TikTok fails without cookies | All three sources blocked | Rare; set `TIKTOK_COOKIES_FILE` as a last resort. |
+| `TelegramConflictError` on startup | Two pollers on one token | Stop the duplicate process (local run vs. deployed instance). |
+| Video plays on Android but not iPhone | Codec | Format selection already prefers H.264 MP4 — report the URL as a bug. |
 
 ---
 
-## Repository layout
+## 🗂️ Repository layout
 
 ```
 LinkToClip/
-├── bot/                 # aiogram app: main, handlers, health server, middleware
-├── services/            # yt-dlp download + optional ffmpeg compression
-├── platforms/           # URL detection + per-site yt-dlp options
-├── utils/               # config, logging, messaging helpers
-├── Dockerfile           # Production image with ffmpeg
-├── requirements.txt
-├── .env.example
-└── README.md
+├── bot/                  # aiogram app: entrypoint, handlers, health server, middleware
+│   └── handlers/         # message handling & upload logic
+├── services/             # download orchestration, fallback chains, ffmpeg compression/splitting
+├── platforms/            # URL detection + per-site yt-dlp format selection
+├── utils/                # config, logging, messaging helpers
+├── .github/              # CI workflow, issue & PR templates
+├── Dockerfile            # Production image (python:3.12-slim + ffmpeg)
+├── render.yaml           # Render Blueprint (background worker)
+├── pyproject.toml        # Tooling config (ruff)
+└── requirements.txt      # Pinned runtime dependencies
 ```
 
 ---
 
-## Limitations
+## 🛠️ Development
 
-- Telegram **Bot API** upload limit is about **50 MB** per file. This project does not implement a local Bot API server or MTProto for larger uploads.  
-- Download success depends on **yt-dlp** and each platform’s availability; private or geo-restricted content may fail.  
-- Respect copyright and each platform’s Terms of Service—only download content you are allowed to access.
+```bash
+pip install -r requirements.txt ruff
+ruff check .          # lint (CI enforces this)
+python -m bot.main    # run locally
+```
 
----
-
-## Legal & disclaimer
-
-This tool is provided for legitimate personal or authorized use only. You are responsible for complying with applicable laws and with the terms of Telegram and each content platform. The authors are not liable for misuse.
+CI runs on every push and PR: ruff lint, import checks on Python 3.11 & 3.12, and a Docker build. See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ---
 
-## Contributing
+## 📏 Limitations
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for how to report issues and propose changes.
+- The Telegram **Bot API** caps uploads at ~50 MB per file. Larger videos are split into parts (or compressed when enabled); a local Bot API server / MTProto is not implemented.
+- Success ultimately depends on what each platform serves: private, geo-restricted, or deleted content will fail with a clear message.
 
----
+## ⚖️ Legal
 
-## License
+For legitimate personal or authorized use only. You are responsible for complying with applicable laws and the terms of Telegram and each content platform. Only download content you have the right to access. The authors accept no liability for misuse.
+
+## 📄 License
 
 Released under the [MIT License](LICENSE).

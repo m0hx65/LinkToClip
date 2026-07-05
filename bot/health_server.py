@@ -1,9 +1,9 @@
-from __future__ import annotations
-
 """
 Public HTTP for Render Web Services: one listener on 0.0.0.0:$PORT (see Render docs).
 Telegram traffic still uses long polling; this only satisfies the platform health check.
 """
+
+from __future__ import annotations
 
 import logging
 import os

@@ -3,12 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from aiohttp.web_runner import AppRunner
-
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiohttp.web_runner import AppRunner
 
 from bot.handlers.download import router as download_router
 from bot.health_server import start_if_configured

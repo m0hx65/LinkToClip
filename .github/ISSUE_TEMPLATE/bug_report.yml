@@ -1,0 +1,55 @@
+name: Bug report
+description: Something is broken or a download fails
+labels: [bug]
+body:
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      description: Which content platform does this affect?
+      options:
+        - Instagram
+        - TikTok
+        - X / Twitter
+        - YouTube
+        - Not platform-specific
+    validations:
+      required: true
+  - type: input
+    id: url
+    attributes:
+      label: Sample URL
+      description: A public link that reproduces the problem (omit if private).
+      placeholder: https://www.instagram.com/reel/...
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you expected vs. what the bot replied.
+    validations:
+      required: true
+  - type: dropdown
+    id: environment
+    attributes:
+      label: Where is the bot running?
+      options:
+        - Local machine
+        - Docker
+        - Render
+        - Other cloud host
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste log lines around the failure. Redact BOT_TOKEN and any cookies.
+      render: text
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I removed all secrets (bot token, cookies) from this report
+          required: true
+        - label: I am running the latest yt-dlp (extraction failures are often fixed upstream)

@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check .
+
+  import-check:
+    name: Import check (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m compileall -q bot services platforms utils
+      - name: Import all modules
+        run: |
+          python -c "
+          import bot.main, bot.handlers.download, bot.health_server, bot.middlewares
+          import services.downloader, services.compressor, services.ig_stories
+          import platforms.detector, platforms.instagram, platforms.tiktok, platforms.twitter, platforms.youtube
+          import utils.config, utils.logging_setup, utils.messaging, utils.urltools
+          print('all modules import cleanly')
+          "
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t linktoclip:ci .

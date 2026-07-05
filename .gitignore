@@ -9,3 +9,15 @@ build/
 data/
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+
+# Cookies exports (never commit sessions)
+cookies.txt
+*cookies*.txt
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

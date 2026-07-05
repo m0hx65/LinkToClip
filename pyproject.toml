@@ -1,0 +1,21 @@
+# Tool configuration. Runtime dependencies are pinned in requirements.txt
+# (used by the Dockerfile and deploy targets).
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E4",  # pycodestyle: imports
+    "E7",  # pycodestyle: statements
+    "E9",  # pycodestyle: runtime errors
+    "F",   # pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # isort import ordering
+    "UP",  # pyupgrade (modern syntax)
+    "B",   # bugbear (likely bugs)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["bot", "platforms", "services", "utils"]
