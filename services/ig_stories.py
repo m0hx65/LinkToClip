@@ -19,6 +19,7 @@ gracefully (returns [] / None) so the caller can fall back to yt-dlp.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -327,11 +328,19 @@ async def download_story_media(
         if exact:
             items = exact
 
-    paths: list[Path] = []
+    # Download items concurrently (highlights can hold dozens); the semaphore
+    # keeps us polite to the CDN and bounds memory. gather preserves order,
+    # so the _<idx> numbering still matches the story sequence.
+    sem = asyncio.Semaphore(4)
+
+    async def _bounded_download(item: StoryItem, dest: Path) -> Path | None:
+        async with sem:
+            return await client.download(item, dest)
+
+    tasks = []
     for idx, item in enumerate(items, 1):
         ext = ".mp4" if item.media_type == "video" else ".jpg"
-        dest = out_dir / f"{out_stem}_{idx}{ext}"
-        p = await client.download(item, dest)
-        if p and p.is_file() and p.stat().st_size > 0:
-            paths.append(p)
+        tasks.append(_bounded_download(item, out_dir / f"{out_stem}_{idx}{ext}"))
+    results = await asyncio.gather(*tasks)
+    paths = [p for p in results if p and p.is_file() and p.stat().st_size > 0]
     return paths, None

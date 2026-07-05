@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,6 +46,87 @@ class DownloadError(Exception):
     def __init__(self, message: str, retryable: bool = False) -> None:
         super().__init__(message)
         self.retryable = retryable
+
+
+# API calls fail fast so the next fallback in the chain starts sooner; media
+# transfers get a generous total budget but still a bounded connect time.
+_API_TIMEOUT = aiohttp.ClientTimeout(total=15, connect=10)
+_MEDIA_TIMEOUT = aiohttp.ClientTimeout(total=300, connect=15)
+
+_http_session: aiohttp.ClientSession | None = None
+
+
+def _get_http_session() -> aiohttp.ClientSession:
+    """One shared session for all fallback downloaders: reuses TCP/TLS
+    connections and caches DNS instead of handshaking on every request."""
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit=16, ttl_dns_cache=300),
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+    return _http_session
+
+
+async def close_http_session() -> None:
+    global _http_session
+    if _http_session is not None:
+        await _http_session.close()
+        _http_session = None
+
+
+async def _fetch_to_file(
+    url: str,
+    out_path: Path,
+    headers: dict[str, str] | None = None,
+) -> Path | None:
+    """Stream a media URL to disk; returns the final path or None on failure.
+
+    Image responses are renamed to .jpg regardless of the guessed extension.
+    """
+    session = _get_http_session()
+    try:
+        async with session.get(url, headers=headers, timeout=_MEDIA_TIMEOUT) as resp:
+            if resp.status != 200:
+                logger.info("media fetch HTTP %s for %s", resp.status, url[:120])
+                return None
+            if "image" in resp.headers.get("Content-Type", ""):
+                out_path = out_path.with_suffix(".jpg")
+            with open(out_path, "wb") as f:
+                async for chunk in resp.content.iter_chunked(1024 * 1024):
+                    f.write(chunk)
+        if out_path.is_file() and out_path.stat().st_size > 0:
+            return out_path
+    except Exception as e:
+        logger.info("media fetch error for %s: %s", url[:120], e)
+    return None
+
+
+# Partial files from failed or interrupted downloads are never referenced
+# again, so sweep anything older than this to keep the disk from filling
+# on long-running instances. Runs at most once per _SWEEP_INTERVAL_S.
+_STALE_AFTER_S = 2 * 3600
+_SWEEP_INTERVAL_S = 1800
+_last_sweep = 0.0
+
+
+def _sweep_stale_files(out_dir: Path) -> None:
+    global _last_sweep
+    now = time.time()
+    if now - _last_sweep < _SWEEP_INTERVAL_S:
+        return
+    _last_sweep = now
+    cutoff = now - _STALE_AFTER_S
+    try:
+        for p in out_dir.iterdir():
+            try:
+                if p.is_file() and p.stat().st_mtime < cutoff:
+                    p.unlink()
+                    logger.info("Swept stale temp file %s", p.name)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 class _YtdlpLogger:
@@ -217,7 +299,12 @@ def _base_opts(out_dir: Path, out_stem: str, settings: Settings, platform: Platf
         "no_warnings": False,
         "retries": 3,
         "fragment_retries": 3,
-        "socket_timeout": 120,
+        # 120s meant a single hung connection stalled the whole download for
+        # two minutes before retrying; 30s recovers much faster.
+        "socket_timeout": 30,
+        # HLS/DASH content (Instagram, YouTube) downloads fragments in
+        # parallel instead of one at a time — the single biggest speedup.
+        "concurrent_fragment_downloads": 4,
         "http_chunk_size": 10 * 1024 * 1024,
     }
     cf = _cookiefile_for_platform(settings, platform)
@@ -368,82 +455,63 @@ async def _fxtwitter_fallback(url: str, out_dir: Path, out_stem: str) -> tuple[l
     tweet_id = m.group("id")
     user = m.group("user") or "i"
     api_url = f"https://api.fxtwitter.com/{user}/status/{tweet_id}"
-    paths: list[Path] = []
-    title: str | None = None
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
-                    logger.info("fxtwitter API %s for tweet %s", resp.status, tweet_id)
-                    return [], None
-                data = await resp.json()
-            tw = data.get("tweet") or {}
-            title = tw.get("text") or None
-            videos = (tw.get("media") or {}).get("videos") or []
-            for idx, video in enumerate(videos, 1):
-                video_url = video.get("url") if isinstance(video, dict) else None
-                if not video_url:
-                    continue
-                out_path = out_dir / f"{out_stem}_{idx}.mp4"
-                try:
-                    async with session.get(video_url, timeout=aiohttp.ClientTimeout(total=300)) as resp:
-                        if resp.status != 200:
-                            logger.info("fxtwitter video %s returned %s", idx, resp.status)
-                            continue
-                        with open(out_path, "wb") as f:
-                            async for chunk in resp.content.iter_chunked(8 * 1024 * 1024):
-                                f.write(chunk)
-                    if out_path.is_file() and out_path.stat().st_size > 0:
-                        paths.append(out_path)
-                except Exception as e:
-                    logger.info("fxtwitter video %s download error: %s", idx, e)
+        session = _get_http_session()
+        async with session.get(api_url, timeout=_API_TIMEOUT) as resp:
+            if resp.status != 200:
+                logger.info("fxtwitter API %s for tweet %s", resp.status, tweet_id)
+                return [], None
+            data = await resp.json()
     except Exception as e:
         logger.info("fxtwitter fallback error: %s", e)
-    return paths, title
+        return [], None
+    tw = data.get("tweet") or {}
+    title: str | None = tw.get("text") or None
+    videos = (tw.get("media") or {}).get("videos") or []
+    video_urls = [v.get("url") for v in videos if isinstance(v, dict) and v.get("url")]
+    results = await asyncio.gather(
+        *(
+            _fetch_to_file(vu, out_dir / f"{out_stem}_{idx}.mp4")
+            for idx, vu in enumerate(video_urls, 1)
+        )
+    )
+    return [p for p in results if p], title
 
 
 async def _tikwm_download(url: str, out_dir: Path, out_stem: str) -> tuple[list[Path], str | None]:
     """Download TikTok via tikwm.com API — no auth, no cookies, works from datacenter IPs."""
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://www.tikwm.com/api/",
-                data={"url": url, "count": 12, "cursor": 0, "web": 1, "hd": 1},
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                if resp.status != 200:
-                    logger.info("tikwm HTTP %s", resp.status)
-                    return [], None
-                data = await resp.json(content_type=None)
-        if data.get("code") != 0:
-            logger.info("tikwm error code=%s msg=%s", data.get("code"), data.get("msg"))
-            return [], None
-        item = data.get("data") or {}
-        title: str | None = item.get("title") or None
-        # Prefer HD play URL, fall back to standard play URL
-        video_url: str | None = item.get("hdplay") or item.get("play") or None
-        if not video_url:
-            logger.info("tikwm no video URL in response")
-            return [], None
-        out_path = out_dir / f"{out_stem}_1.mp4"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                video_url,
-                headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.tikwm.com/"},
-                timeout=aiohttp.ClientTimeout(total=300),
-            ) as resp:
-                if resp.status != 200:
-                    logger.info("tikwm video download HTTP %s", resp.status)
-                    return [], None
-                with open(out_path, "wb") as f:
-                    async for chunk in resp.content.iter_chunked(8 * 1024 * 1024):
-                        f.write(chunk)
-        if out_path.is_file() and out_path.stat().st_size > 0:
-            logger.info("tikwm ok title=%r", title)
-            return [out_path], title
+        session = _get_http_session()
+        async with session.post(
+            "https://www.tikwm.com/api/",
+            data={"url": url, "count": 12, "cursor": 0, "web": 1, "hd": 1},
+            timeout=_API_TIMEOUT,
+        ) as resp:
+            if resp.status != 200:
+                logger.info("tikwm HTTP %s", resp.status)
+                return [], None
+            data = await resp.json(content_type=None)
     except Exception as e:
         logger.info("tikwm error: %s", e)
+        return [], None
+    if data.get("code") != 0:
+        logger.info("tikwm error code=%s msg=%s", data.get("code"), data.get("msg"))
+        return [], None
+    item = data.get("data") or {}
+    title: str | None = item.get("title") or None
+    # Prefer HD play URL, fall back to standard play URL
+    video_url: str | None = item.get("hdplay") or item.get("play") or None
+    if not video_url:
+        logger.info("tikwm no video URL in response")
+        return [], None
+    out_path = await _fetch_to_file(
+        video_url,
+        out_dir / f"{out_stem}_1.mp4",
+        headers={"Referer": "https://www.tikwm.com/"},
+    )
+    if out_path:
+        logger.info("tikwm ok title=%r", title)
+        return [out_path], title
     return [], None
 
 
@@ -456,21 +524,20 @@ async def _cobalt_download(url: str, out_dir: Path, out_stem: str) -> tuple[list
     """Download via cobalt.tools API (v11+). Works from datacenter IPs for YouTube, TikTok, Instagram, Twitter."""
     media_urls: list[str] = []
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://api.cobalt.tools/",
-                json={"url": url, "videoQuality": "max"},
-                headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",
-                    "User-Agent": "Mozilla/5.0",
-                },
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                if resp.status != 200:
-                    logger.info("cobalt.tools HTTP %s for %s", resp.status, url)
-                    return [], None
-                data = await resp.json()
+        session = _get_http_session()
+        async with session.post(
+            "https://api.cobalt.tools/",
+            json={"url": url, "videoQuality": "max"},
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            timeout=_API_TIMEOUT,
+        ) as resp:
+            if resp.status != 200:
+                logger.info("cobalt.tools HTTP %s for %s", resp.status, url)
+                return [], None
+            data = await resp.json()
         status = data.get("status")
         if status in ("tunnel", "redirect") and data.get("url"):
             media_urls.append(data["url"])
@@ -486,31 +553,17 @@ async def _cobalt_download(url: str, out_dir: Path, out_stem: str) -> tuple[list
     if not media_urls:
         return [], None
 
-    paths: list[Path] = []
-    async with aiohttp.ClientSession() as session:
-        for idx, media_url in enumerate(media_urls, 1):
-            ext = "mp4" if ".mp4" in media_url.lower() else "jpg"
-            out_path = out_dir / f"{out_stem}_{idx}.{ext}"
-            try:
-                async with session.get(
-                    media_url,
-                    headers={"User-Agent": "Mozilla/5.0"},
-                    timeout=aiohttp.ClientTimeout(total=300),
-                ) as resp:
-                    if resp.status != 200:
-                        logger.info("cobalt media %s HTTP %s", idx, resp.status)
-                        continue
-                    ct = resp.headers.get("Content-Type", "")
-                    if "image" in ct:
-                        out_path = out_path.with_suffix(".jpg")
-                    with open(out_path, "wb") as f:
-                        async for chunk in resp.content.iter_chunked(8 * 1024 * 1024):
-                            f.write(chunk)
-                if out_path.is_file() and out_path.stat().st_size > 0:
-                    paths.append(out_path)
-            except Exception as e:
-                logger.info("cobalt media %s download error: %s", idx, e)
-    return paths, None
+    def _guessed_path(idx: int, media_url: str) -> Path:
+        ext = "mp4" if ".mp4" in media_url.lower() else "jpg"
+        return out_dir / f"{out_stem}_{idx}.{ext}"
+
+    results = await asyncio.gather(
+        *(
+            _fetch_to_file(media_url, _guessed_path(idx, media_url))
+            for idx, media_url in enumerate(media_urls, 1)
+        )
+    )
+    return [p for p in results if p], None
 
 
 async def download_media(url: str, settings: Settings) -> DownloadResult:
@@ -533,6 +586,7 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
 
     out_dir = settings.temp_dir
     out_dir.mkdir(parents=True, exist_ok=True)
+    _sweep_stale_files(out_dir)
     out_stem = f"{uuid.uuid4().hex}"
 
     logger.info("Downloading url=%s platform=%s", url, platform.value)

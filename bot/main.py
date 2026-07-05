@@ -14,6 +14,7 @@ from bot.handlers.download import router as download_router
 from bot.health_server import start_if_configured
 from bot.middlewares import SettingsMiddleware
 from services import ig_stories
+from services.downloader import close_http_session
 from utils.config import load_settings
 from utils.logging_setup import setup_logging
 
@@ -44,6 +45,7 @@ async def main() -> None:
         await dp.start_polling(bot)
     finally:
         await ig_stories.close_client()
+        await close_http_session()
         if http_runner is not None:
             await http_runner.cleanup()
 

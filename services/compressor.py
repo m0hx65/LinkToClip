@@ -4,13 +4,19 @@ import asyncio
 import logging
 import shutil
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 
-async def ffmpeg_available() -> bool:
+@lru_cache(maxsize=1)
+def _ffmpeg_on_path() -> bool:
     return shutil.which("ffmpeg") is not None
+
+
+async def ffmpeg_available() -> bool:
+    return _ffmpeg_on_path()
 
 
 def _run_ffmpeg_sync(

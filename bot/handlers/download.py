@@ -143,36 +143,9 @@ async def on_text(
             photo_paths = [p for p in work_paths if _is_image(p)]
             video_paths = [p for p in work_paths if not _is_image(p)]
 
-            caption = (result.title or "")[:1024]
-            caption_used = False
-            sent_anything = False
-
-            # --- Send photos (single or carousel groups of up to 10) ---
-            if photo_paths:
-                await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
-                for chunk_start in range(0, len(photo_paths), 10):
-                    chunk = photo_paths[chunk_start:chunk_start + 10]
-                    cap = (caption or None) if not caption_used else None
-                    if len(chunk) == 1:
-                        await message.answer_photo(
-                            FSInputFile(chunk[0]),
-                            caption=cap,
-                            parse_mode=None,
-                        )
-                    else:
-                        media = [
-                            InputMediaPhoto(
-                                media=FSInputFile(p),
-                                caption=(cap if j == 0 else None),
-                                parse_mode=None,
-                            )
-                            for j, p in enumerate(chunk)
-                        ]
-                        await message.answer_media_group(media)
-                    caption_used = True
-                    sent_anything = True
-
-            # --- Send videos (with optional compression / splitting) ---
+            # Compression and splitting are the CPU/RAM-heavy steps, so they
+            # stay inside the semaphore. The Telegram uploads below run outside
+            # it, letting the next queued download start while this one uploads.
             send_items: list[tuple[Path, str | None]] = []
             for source_path in video_paths:
                 size = source_path.stat().st_size
@@ -211,32 +184,62 @@ async def on_text(
                     else:
                         logger.warning("Split failed for %s", source_path)
 
-            for send_path, part_label in send_items:
-                await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_VIDEO)
-                vid = FSInputFile(send_path)
-                if not caption_used:
-                    cap = f"{caption}\n{part_label}" if (caption and part_label) else (caption or part_label or None)
-                    caption_used = True
+        caption = (result.title or "")[:1024]
+        caption_used = False
+        sent_anything = False
+
+        # --- Send photos (single or carousel groups of up to 10) ---
+        if photo_paths:
+            await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
+            for chunk_start in range(0, len(photo_paths), 10):
+                chunk = photo_paths[chunk_start:chunk_start + 10]
+                cap = (caption or None) if not caption_used else None
+                if len(chunk) == 1:
+                    await message.answer_photo(
+                        FSInputFile(chunk[0]),
+                        caption=cap,
+                        parse_mode=None,
+                    )
                 else:
-                    cap = part_label
-                await message.answer_video(
-                    vid,
-                    caption=cap,
-                    supports_streaming=True,
-                    parse_mode=None,
-                )
+                    media = [
+                        InputMediaPhoto(
+                            media=FSInputFile(p),
+                            caption=(cap if j == 0 else None),
+                            parse_mode=None,
+                        )
+                        for j, p in enumerate(chunk)
+                    ]
+                    await message.answer_media_group(media)
+                caption_used = True
                 sent_anything = True
 
-            if sent_anything:
-                await status.delete()
+        # --- Send videos ---
+        for send_path, part_label in send_items:
+            await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_VIDEO)
+            vid = FSInputFile(send_path)
+            if not caption_used:
+                cap = f"{caption}\n{part_label}" if (caption and part_label) else (caption or part_label or None)
+                caption_used = True
             else:
-                direct_urls = await get_direct_urls(url, settings)
-                lines = ["Could not send the file (splitting failed). Download links:"]
-                for u in direct_urls[:5]:
-                    lines.append(u)
-                if not direct_urls:
-                    lines.append("No stable direct URL. Try downloading on a PC with yt-dlp.")
-                await edit_or_replace_status(status, "\n".join(lines))
+                cap = part_label
+            await message.answer_video(
+                vid,
+                caption=cap,
+                supports_streaming=True,
+                parse_mode=None,
+            )
+            sent_anything = True
+
+        if sent_anything:
+            await status.delete()
+        else:
+            direct_urls = await get_direct_urls(url, settings)
+            lines = ["Could not send the file (splitting failed). Download links:"]
+            for u in direct_urls[:5]:
+                lines.append(u)
+            if not direct_urls:
+                lines.append("No stable direct URL. Try downloading on a PC with yt-dlp.")
+            await edit_or_replace_status(status, "\n".join(lines))
 
     except DownloadError as e:
         logger.warning("DownloadError: %s", e)
