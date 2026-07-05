@@ -20,7 +20,8 @@ A Telegram bot that downloads videos and photos from Instagram, TikTok, X (Twitt
 
 - **Instagram** — reels, posts, photo carousels, **stories & highlights** — all served anonymously first (no login or cookies needed for public content, even from cloud IPs)
 - **TikTok** — videos **and photo-mode posts**, from cloud/datacenter IPs without cookies
-- **X / Twitter** — including **multi-video tweets**; fast path through the fxtwitter API
+- **X / Twitter** — grabs **every attachment in a tweet**: photos, videos, GIFs, and mixed photo+video posts; fast path through the fxtwitter API
+- **Multiple links per message** — paste up to 10 links in one message; each is downloaded and sent in order, and one bad link doesn't stop the rest
 - **YouTube** — picks the highest-resolution H.264 stream so videos play everywhere, including iOS
 - **Big files handled** — optional ffmpeg compression, and automatic **splitting into parts** when a video exceeds Telegram's ~50 MB Bot API limit
 - **Resilient by design** — every platform has a chain of independent download sources; if one service is down, the next takes over automatically
@@ -140,7 +141,7 @@ Same recipe: provide `BOT_TOKEN`, prefer the Docker image (ffmpeg included), and
 |---------|--------------|-------------|
 | Exit code **137** / "Killed" | Out of memory | Keep concurrency at 1, disable compression, or upsize the instance. |
 | Instagram posts always fail on the server | saveinsta.to hiccup or private account | Public content needs no cookies — retry in a minute. Private accounts always need `COOKIES_FILE`; also verify `TEMP_DIR` is writable. |
-| "No video could be found" (X) | Tweet has no video | Expected for text/photo-only posts. |
+| "No video could be found" (X) | Text-only tweet, or fxtwitter is down | Photo tweets normally work via fxtwitter; if it's down, only videos are recoverable through yt-dlp. |
 | TikTok fails without cookies | Both sources blocked | Rare; set `TIKTOK_COOKIES_FILE` as a last resort. |
 | `TelegramConflictError` on startup | Two pollers on one token | Stop the duplicate process (local run vs. deployed instance). |
 | Video plays on Android but not iPhone | Codec | Format selection already prefers H.264 MP4 — report the URL as a bug. |

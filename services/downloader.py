@@ -450,7 +450,8 @@ def _download_sync(url: str, ydl_opts: dict[str, Any]) -> tuple[list[Path], str 
 
 
 async def _fxtwitter_fallback(url: str, out_dir: Path, out_stem: str) -> tuple[list[Path], str | None]:
-    """Download via fxtwitter API — works from datacenter IPs without auth."""
+    """Download all tweet media (videos, photos, GIFs) via the fxtwitter API —
+    works from datacenter IPs without auth. Mixed-media tweets are supported."""
     m = _TW_STATUS_RE.match(url.strip())
     if not m:
         return [], None
@@ -469,14 +470,20 @@ async def _fxtwitter_fallback(url: str, out_dir: Path, out_stem: str) -> tuple[l
         return [], None
     tw = data.get("tweet") or {}
     title: str | None = tw.get("text") or None
-    videos = (tw.get("media") or {}).get("videos") or []
-    video_urls = [v.get("url") for v in videos if isinstance(v, dict) and v.get("url")]
-    results = await asyncio.gather(
-        *(
-            _fetch_to_file(vu, out_dir / f"{out_stem}_{idx}.mp4")
-            for idx, vu in enumerate(video_urls, 1)
-        )
-    )
+    media = tw.get("media") or {}
+    # `all` preserves the tweet's media order for mixed photo/video posts;
+    # fall back to the separate lists if it's missing.
+    items = media.get("all")
+    if not isinstance(items, list) or not items:
+        items = [*(media.get("videos") or []), *(media.get("photos") or [])]
+    tasks = []
+    for idx, item in enumerate(items, 1):
+        if not (isinstance(item, dict) and item.get("url")):
+            continue
+        # Photos are .jpg; videos and GIFs (which fxtwitter serves as mp4) are .mp4.
+        ext = "jpg" if item.get("type") == "photo" else "mp4"
+        tasks.append(_fetch_to_file(str(item["url"]), out_dir / f"{out_stem}_{idx}.{ext}"))
+    results = await asyncio.gather(*tasks)
     return [p for p in results if p], title
 
 
@@ -621,14 +628,15 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
             return DownloadResult(path=paths[0], paths=paths, title=title, direct_urls=[], platform=platform)
         logger.info("tikwm TikTok failed; falling back to yt-dlp")
 
-    # Twitter: fxtwitter first — instant on cloud IPs, no auth needed.
-    # Fall through to yt-dlp only if fxtwitter has no video (private/deleted/no-media tweet).
+    # Twitter: fxtwitter first — instant on cloud IPs, no auth needed, and it
+    # returns every attachment (photos, videos, GIFs) of mixed-media tweets.
+    # Fall through to yt-dlp only if fxtwitter has nothing (private/deleted tweet).
     if platform is Platform.TWITTER:
         paths, title = await _fxtwitter_fallback(url, out_dir, out_stem)
         if paths:
             logger.info("fxtwitter ok files=%s", len(paths))
             return DownloadResult(path=paths[0], paths=paths, title=title, direct_urls=[], platform=platform)
-        logger.info("fxtwitter no videos; falling back to yt-dlp")
+        logger.info("fxtwitter no media; falling back to yt-dlp")
 
 
     ydl_opts, _ = _build_ydl_opts(url, out_dir, out_stem, settings)

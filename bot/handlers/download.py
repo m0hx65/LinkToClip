@@ -47,15 +47,26 @@ def _is_image(path: Path) -> bool:
     return path.suffix.lower() in _IMAGE_EXTS
 
 
-def _extract_url(text: str) -> str | None:
+# Telegram messages can carry many links; cap the work per message so one
+# paste can't monopolize the bot for everyone else.
+_MAX_LINKS_PER_MESSAGE = 10
+
+
+def _extract_urls(text: str) -> list[str]:
+    """All downloadable URLs in the message, de-duplicated, in message order."""
     text = text.strip()
-    m = _URL_RE.search(text)
-    if m:
-        return normalize_http_url(m.group(0).rstrip(").,]"))
-    m2 = _BARE_HOST.search(text)
-    if m2:
-        return normalize_http_url("https://" + m2.group(0).rstrip(").,]"))
-    return None
+    found: list[tuple[int, str]] = []
+    spans: list[tuple[int, int]] = []
+    for m in _URL_RE.finditer(text):
+        found.append((m.start(), normalize_http_url(m.group(0).rstrip(").,]"))))
+        spans.append(m.span())
+    for m in _BARE_HOST.finditer(text):
+        # Skip bare-host matches that are part of a full URL already captured.
+        if any(s <= m.start() < e for s, e in spans):
+            continue
+        found.append((m.start(), normalize_http_url("https://" + m.group(0).rstrip(").,]"))))
+    found.sort(key=lambda t: t[0])
+    return list(dict.fromkeys(u for _, u in found))
 
 
 async def _safe_unlink(path: Path | None) -> None:
@@ -86,17 +97,55 @@ async def on_text(
     message: Message,
     settings: Settings,
 ) -> None:
-    url = _extract_url(message.text or "")
-    if not url:
+    urls = _extract_urls(message.text or "")
+    if not urls:
         return
+
+    note: str | None = None
+    if len(urls) > _MAX_LINKS_PER_MESSAGE:
+        note = (
+            f"Note: only the first {_MAX_LINKS_PER_MESSAGE} links per message are "
+            f"processed ({len(urls) - _MAX_LINKS_PER_MESSAGE} skipped)."
+        )
+        urls = urls[:_MAX_LINKS_PER_MESSAGE]
 
     await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_VIDEO)
     status = await message.reply("Downloading...")
+    semaphore = _get_download_semaphore(settings.max_concurrent_downloads)
 
+    failures: list[str] = []
+    for idx, url in enumerate(urls, 1):
+        if len(urls) > 1:
+            await edit_or_replace_status(status, f"Downloading link {idx}/{len(urls)}...")
+        error = await _download_and_send(message, status, url, settings, semaphore)
+        if error:
+            failures.append(error if len(urls) == 1 else f"Link {idx}: {error}")
+
+    lines = failures + ([note] if note else [])
+    if lines:
+        await edit_or_replace_status(status, "\n\n".join(lines))
+    else:
+        try:
+            await status.delete()
+        except Exception:
+            logger.debug("Could not delete status message", exc_info=True)
+
+
+async def _download_and_send(
+    message: Message,
+    status: Message,
+    url: str,
+    settings: Settings,
+    semaphore: asyncio.Semaphore,
+) -> str | None:
+    """Download one link and send its media to the chat.
+
+    Returns None on success, or user-facing error text for the caller to
+    report. Temp files are always cleaned up.
+    """
     work_paths: list[Path] = []
     compressed_paths: list[Path] = []
     part_paths: list[Path] = []
-    semaphore = _get_download_semaphore(settings.max_concurrent_downloads)
 
     try:
         if semaphore.locked():
@@ -135,8 +184,7 @@ async def on_text(
                     lines.append(u)
                 if not direct_urls:
                     lines.append("(No direct URL available.)")
-                await edit_or_replace_status(status, "\n".join(lines))
-                return
+                return "\n".join(lines)
 
             logger.info("Download ok files=%s title=%s", len(work_paths), result.title)
 
@@ -231,22 +279,21 @@ async def on_text(
             sent_anything = True
 
         if sent_anything:
-            await status.delete()
-        else:
-            direct_urls = await get_direct_urls(url, settings)
-            lines = ["Could not send the file (splitting failed). Download links:"]
-            for u in direct_urls[:5]:
-                lines.append(u)
-            if not direct_urls:
-                lines.append("No stable direct URL. Try downloading on a PC with yt-dlp.")
-            await edit_or_replace_status(status, "\n".join(lines))
+            return None
+        direct_urls = await get_direct_urls(url, settings)
+        lines = ["Could not send the file (splitting failed). Download links:"]
+        for u in direct_urls[:5]:
+            lines.append(u)
+        if not direct_urls:
+            lines.append("No stable direct URL. Try downloading on a PC with yt-dlp.")
+        return "\n".join(lines)
 
     except DownloadError as e:
         logger.warning("DownloadError: %s", e)
-        await edit_or_replace_status(status, str(e))
+        return str(e)
     except Exception:
         logger.exception("Handler error")
-        await edit_or_replace_status(status, "Something went wrong. Please try again later.")
+        return "Something went wrong. Please try again later."
     finally:
         for p in [*part_paths, *compressed_paths, *work_paths]:
             await _safe_unlink(p)
