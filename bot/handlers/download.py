@@ -12,6 +12,7 @@ from aiogram.types import FSInputFile, InputMediaPhoto, Message
 
 from services.compressor import compress_video, split_video
 from services.downloader import DownloadError, download_media, get_direct_urls
+from services.mtproto_sender import send_large_video
 from utils.config import Settings
 from utils.messaging import edit_or_replace_status
 from utils.urltools import normalize_http_url
@@ -194,11 +195,22 @@ async def _download_and_send(
             # Compression and splitting are the CPU/RAM-heavy steps, so they
             # stay inside the semaphore. The Telegram uploads below run outside
             # it, letting the next queued download start while this one uploads.
-            send_items: list[tuple[Path, str | None]] = []
+            send_items: list[tuple[Path, str | None, bool]] = []
             for source_path in video_paths:
                 size = source_path.stat().st_size
 
-                if size > settings.telegram_max_file_bytes and settings.enable_compression:
+                # Files over the Bot API limit go out over MTProto untouched
+                # (up to ~2 GB) when API_ID/API_HASH are configured, so no
+                # compression or splitting is needed for them.
+                can_mtproto = (
+                    settings.mtproto_enabled and size <= settings.mtproto_max_file_bytes
+                )
+
+                if (
+                    size > settings.telegram_max_file_bytes
+                    and not can_mtproto
+                    and settings.enable_compression
+                ):
                     compressed_path = source_path.with_name(source_path.stem + "_compressed.mp4")
                     ok = await compress_video(
                         source_path,
@@ -214,7 +226,9 @@ async def _download_and_send(
                             logger.info("Compressed to %s bytes", size)
 
                 if size <= settings.telegram_max_file_bytes:
-                    send_items.append((source_path, None))
+                    send_items.append((source_path, None, False))
+                elif can_mtproto:
+                    send_items.append((source_path, None, True))
                 else:
                     await edit_or_replace_status(
                         status,
@@ -226,7 +240,7 @@ async def _download_and_send(
                     if parts:
                         n = len(parts)
                         for i, p in enumerate(parts, 1):
-                            send_items.append((p, f"Part {i}/{n}"))
+                            send_items.append((p, f"Part {i}/{n}", False))
                         part_paths.extend(parts)
                         logger.info("Split into %d parts: %s", n, source_path.name)
                     else:
@@ -262,16 +276,52 @@ async def _download_and_send(
                 sent_anything = True
 
         # --- Send videos ---
-        for send_path, part_label in send_items:
+        for send_path, part_label, via_mtproto in send_items:
             await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_VIDEO)
-            vid = FSInputFile(send_path)
             if not caption_used:
                 cap = f"{caption}\n{part_label}" if (caption and part_label) else (caption or part_label or None)
                 caption_used = True
             else:
                 cap = part_label
+
+            if via_mtproto:
+                ok = await send_large_video(
+                    settings,
+                    message.chat.id,
+                    send_path,
+                    cap,
+                    status_update=lambda text: edit_or_replace_status(status, text),
+                )
+                if ok:
+                    sent_anything = True
+                    continue
+                # MTProto upload failed — fall back to the old split-into-parts path.
+                size_mb = send_path.stat().st_size // (1024 * 1024)
+                await edit_or_replace_status(
+                    status,
+                    f"Large upload failed — splitting the {size_mb} MB file into parts...",
+                )
+                parts = await split_video(
+                    send_path, send_path.parent, settings.telegram_max_file_bytes
+                )
+                if not parts:
+                    logger.warning("Split failed for %s", send_path)
+                    continue
+                part_paths.extend(parts)
+                n = len(parts)
+                for i, p in enumerate(parts, 1):
+                    label = f"Part {i}/{n}"
+                    await message.answer_video(
+                        FSInputFile(p),
+                        caption=f"{cap}\n{label}" if (cap and i == 1) else label,
+                        supports_streaming=True,
+                        parse_mode=None,
+                    )
+                    sent_anything = True
+                continue
+
             await message.answer_video(
-                vid,
+                FSInputFile(send_path),
                 caption=cap,
                 supports_streaming=True,
                 parse_mode=None,

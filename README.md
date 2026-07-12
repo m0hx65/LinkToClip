@@ -23,7 +23,7 @@ A Telegram bot that downloads videos and photos from Instagram, TikTok, X (Twitt
 - **X / Twitter** — grabs **every attachment in a tweet**: photos, videos, GIFs, and mixed photo+video posts; fast path through the fxtwitter API
 - **Multiple links per message** — paste up to 10 links in one message; each is downloaded and sent in order, and one bad link doesn't stop the rest
 - **YouTube** — picks the highest-resolution H.264 stream so videos play everywhere, including iOS
-- **Big files handled** — optional ffmpeg compression, and automatic **splitting into parts** when a video exceeds Telegram's ~50 MB Bot API limit
+- **Big files sent whole** — with Telegram API credentials set (`API_ID`/`API_HASH`), videos over the Bot API's ~50 MB cap are uploaded over **MTProto up to ~2 GB**, exactly as downloaded — no compression, no re-encoding, no splitting. Without credentials, the bot falls back to optional ffmpeg compression and automatic splitting into parts
 - **Resilient by design** — every platform has a chain of independent download sources; if one service is down, the next takes over automatically
 - **Built for small hosts** — bounded concurrency, streaming downloads, and stale-file cleanup keep memory and disk usage flat on free-tier instances
 
@@ -45,7 +45,8 @@ flowchart LR
     FX -. fallback .-> Y
     S & TK & FX & Y --> SZ{"fits 50 MB?"}
     SZ -- "yes" --> OK[Sent to chat]
-    SZ -- "no" --> CP["compress (optional) → split into parts"] --> OK
+    SZ -- "no, API_ID/API_HASH set" --> MT["MTProto upload (whole file, ≤ 2 GB)"] --> OK
+    SZ -- "no, no credentials" --> CP["compress (optional) → split into parts"] --> OK
 ```
 
 - **Long polling** — updates arrive via `getUpdates`; no webhook or public URL required.
@@ -94,6 +95,9 @@ All configuration is via environment variables (or a local `.env` file — see [
 | Variable | Required | Default | Description |
 |----------|:--------:|---------|-------------|
 | `BOT_TOKEN` | ✅ | — | Telegram bot token from [@BotFather](https://t.me/BotFather). |
+| `API_ID` / `API_HASH` | | — | Telegram API credentials from [my.telegram.org](https://my.telegram.org) → *API development tools*. When set, videos over ~50 MB upload whole via MTProto (up to ~2 GB) instead of being split. |
+| `MTPROTO_MAX_FILE_BYTES` | | ~1990 MB | Ceiling for MTProto uploads, just under Telegram's 2000 MB bot limit. |
+| `MTPROTO_SESSION_DIR` | | `./data` | Directory for the MTProto session file. Keep it outside `TEMP_DIR` so it isn't swept. |
 | `LOG_LEVEL` | | `INFO` | Logging verbosity. |
 | `TEMP_DIR` | | `./data/temp` | Scratch directory for downloads. Use `/tmp` on most cloud hosts. |
 | `TELEGRAM_MAX_FILE_BYTES` | | ~49 MB | Upload ceiling; stays under the Bot API's ~50 MB limit. |
@@ -114,7 +118,7 @@ All configuration is via environment variables (or a local `.env` file — see [
 ### Render
 
 1. Connect this repository and choose the **Docker** runtime.
-2. Set `BOT_TOKEN` in the environment.
+2. Set `BOT_TOKEN` in the environment (plus `API_ID`/`API_HASH` to send large videos whole).
 3. For a **Web Service**, Render injects `PORT` and the health server binds automatically; for a **Background Worker**, use the included [`render.yaml`](render.yaml) Blueprint.
 4. Recommended: `TEMP_DIR=/tmp`. Add `COOKIES_FILE` if Instagram posts/reels fail from Render's IPs.
 
@@ -180,7 +184,7 @@ CI runs on every push and PR: ruff lint, import checks on Python 3.11 & 3.12, an
 
 ## 📏 Limitations
 
-- The Telegram **Bot API** caps uploads at ~50 MB per file. Larger videos are split into parts (or compressed when enabled); a local Bot API server / MTProto is not implemented.
+- Telegram caps bot uploads at **~2 GB** (MTProto, with `API_ID`/`API_HASH` set). Beyond that — or when credentials aren't configured, where the ~50 MB Bot API limit applies — videos are split into parts (or compressed when enabled).
 - Success ultimately depends on what each platform serves: private, geo-restricted, or deleted content will fail with a clear message.
 
 ## ⚖️ Legal

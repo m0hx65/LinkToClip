@@ -12,7 +12,7 @@ from aiohttp.web_runner import AppRunner
 from bot.handlers.download import router as download_router
 from bot.health_server import start_if_configured
 from bot.middlewares import SettingsMiddleware
-from services import ig_stories
+from services import ig_stories, mtproto_sender
 from services.downloader import close_http_session
 from utils.config import load_settings
 from utils.logging_setup import setup_logging
@@ -34,6 +34,13 @@ async def main() -> None:
     dp.include_router(download_router)
 
     logger.info("Bot starting")
+    if settings.mtproto_enabled:
+        logger.info("MTProto large-file uploads enabled (up to ~2 GB, no splitting)")
+    else:
+        logger.info(
+            "API_ID/API_HASH not set — videos over ~50 MB will be split into parts. "
+            "Get credentials at https://my.telegram.org to send large files whole."
+        )
     logger.info(
         "Using long polling (getUpdates). Run only one process with this BOT_TOKEN — e.g. stop a "
         "local run if the bot is deployed on Render, or scale duplicate workers to one. "
@@ -44,6 +51,7 @@ async def main() -> None:
         await dp.start_polling(bot)
     finally:
         await ig_stories.close_client()
+        await mtproto_sender.close_client()
         await close_http_session()
         if http_runner is not None:
             await http_runner.cleanup()

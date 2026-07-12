@@ -22,6 +22,15 @@ class Settings:
     twitter_cookies_file: Path | None
     youtube_cookies_file: Path | None
     max_concurrent_downloads: int
+    api_id: int | None
+    api_hash: str | None
+    mtproto_max_file_bytes: int
+    mtproto_session_dir: Path
+
+    @property
+    def mtproto_enabled(self) -> bool:
+        """Large files can be uploaded over MTProto (up to ~2 GB, no re-encoding)."""
+        return self.api_id is not None and bool(self.api_hash)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -51,6 +60,13 @@ def load_settings() -> Settings:
     yt_cookies = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
     youtube_cookies_path = Path(yt_cookies) if yt_cookies else None
 
+    api_id_raw = os.getenv("API_ID", "").strip()
+    api_id = int(api_id_raw) if api_id_raw else None
+    api_hash = os.getenv("API_HASH", "").strip() or None
+
+    session_dir_raw = os.getenv("MTPROTO_SESSION_DIR", "").strip()
+    mtproto_session_dir = Path(session_dir_raw) if session_dir_raw else Path.cwd() / "data"
+
     return Settings(
         bot_token=token,
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -67,4 +83,11 @@ def load_settings() -> Settings:
         twitter_cookies_file=twitter_cookies_path,
         youtube_cookies_file=youtube_cookies_path,
         max_concurrent_downloads=max(int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "1")), 1),
+        api_id=api_id,
+        api_hash=api_hash,
+        # MTProto bot upload ceiling is 2000 MB; leave a small margin.
+        mtproto_max_file_bytes=int(
+            os.getenv("MTPROTO_MAX_FILE_BYTES", str(1990 * 1024 * 1024))
+        ),
+        mtproto_session_dir=mtproto_session_dir,
     )
