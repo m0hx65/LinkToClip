@@ -63,17 +63,27 @@ def _sendable_url(path: Path, sources: dict[Path, str], *, is_photo: bool) -> st
     """The public URL Telegram can fetch instead of us uploading `path`.
 
     None when the file has no public source (yt-dlp results, compressed or
-    split files) or is over the Bot API's URL-send limit.
+    split files) or is over the Bot API's URL-send limit. Every rejection is
+    logged: the whole point of this path is bandwidth, so "we uploaded it"
+    must never be silent — otherwise the logs can't tell a working URL send
+    from a fallback that never tried.
     """
     url = sources.get(path)
     if not url:
+        logger.info("Uploading %s: no public source URL for it", path.name)
         return None
     try:
         size = path.stat().st_size
     except OSError:
         return None
     limit = _URL_SEND_MAX_PHOTO if is_photo else _URL_SEND_MAX_VIDEO
-    return url if size <= limit else None
+    if size > limit:
+        logger.info(
+            "Uploading %s: %.1f MB exceeds the %d MB URL-send cap",
+            path.name, size / (1024 * 1024), limit // (1024 * 1024),
+        )
+        return None
+    return url
 
 
 # Telegram messages can carry many links; cap the work per message so one
@@ -176,6 +186,7 @@ async def _send_video_by_url(message: Message, url: str, caption: str | None) ->
             supports_streaming=True,
             parse_mode=None,
         )
+        logger.info("Sent by URL, no upload: %s", url[:100])
         return True
     except TelegramBadRequest as e:
         logger.info("URL send refused (%s) for %s — uploading instead", e, url[:100])
@@ -185,6 +196,7 @@ async def _send_video_by_url(message: Message, url: str, caption: str | None) ->
 async def _send_photo_by_url(message: Message, url: str, caption: str | None) -> bool:
     try:
         await message.answer_photo(url, caption=caption, parse_mode=None)
+        logger.info("Sent by URL, no upload: %s", url[:100])
         return True
     except TelegramBadRequest as e:
         logger.info("URL send refused (%s) for %s — uploading instead", e, url[:100])
@@ -205,6 +217,7 @@ async def _send_album_by_url(
                 for j, u in enumerate(urls)
             ]
         )
+        logger.info("Sent album by URL, no upload: %d photos", len(urls))
         return True
     except TelegramBadRequest as e:
         logger.info("URL album send refused (%s) — uploading %d files", e, len(urls))
