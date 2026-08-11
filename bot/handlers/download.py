@@ -9,7 +9,7 @@ from aiogram import F, Router
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
-from aiogram.types import FSInputFile, InputMediaPhoto, Message
+from aiogram.types import FSInputFile, InputMediaPhoto, Message, ReplyParameters
 
 from services.compressor import compress_video, split_video
 from services.downloader import DownloadError, download_media, get_direct_urls
@@ -177,6 +177,19 @@ async def on_text(
 # and a timed-out request may well have been delivered, so falling back to an
 # upload there could post the same video twice. Those propagate to the
 # caller's handler exactly as an upload failure always has.
+def _reply_to(message: Message) -> ReplyParameters:
+    """Attach results to the message that carried the link.
+
+    allow_sending_without_reply keeps the media coming even if that message
+    is gone by the time the download finishes — deleting the link mid-download
+    should not cost the user the video.
+    """
+    return ReplyParameters(
+        message_id=message.message_id,
+        allow_sending_without_reply=True,
+    )
+
+
 async def _send_video_by_url(message: Message, url: str, caption: str | None) -> bool:
     """Ask Telegram to fetch and post the video itself. False if it refused."""
     try:
@@ -185,6 +198,7 @@ async def _send_video_by_url(message: Message, url: str, caption: str | None) ->
             caption=caption,
             supports_streaming=True,
             parse_mode=None,
+            reply_parameters=_reply_to(message),
         )
         logger.info("Sent by URL, no upload: %s", url[:100])
         return True
@@ -195,7 +209,12 @@ async def _send_video_by_url(message: Message, url: str, caption: str | None) ->
 
 async def _send_photo_by_url(message: Message, url: str, caption: str | None) -> bool:
     try:
-        await message.answer_photo(url, caption=caption, parse_mode=None)
+        await message.answer_photo(
+            url,
+            caption=caption,
+            parse_mode=None,
+            reply_parameters=_reply_to(message),
+        )
         logger.info("Sent by URL, no upload: %s", url[:100])
         return True
     except TelegramBadRequest as e:
@@ -215,7 +234,8 @@ async def _send_album_by_url(
                     parse_mode=None,
                 )
                 for j, u in enumerate(urls)
-            ]
+            ],
+            reply_parameters=_reply_to(message),
         )
         logger.info("Sent album by URL, no upload: %d photos", len(urls))
         return True
@@ -360,6 +380,7 @@ async def _download_and_send(
                             FSInputFile(chunk[0]),
                             caption=cap,
                             parse_mode=None,
+                            reply_parameters=_reply_to(message),
                         )
                 else:
                     # One send_media_group call is all-or-nothing, so retrying
@@ -374,7 +395,9 @@ async def _download_and_send(
                             )
                             for j, p in enumerate(chunk)
                         ]
-                        await message.answer_media_group(media)
+                        await message.answer_media_group(
+                            media, reply_parameters=_reply_to(message)
+                        )
                 caption_used = True
                 sent_anything = True
 
@@ -402,6 +425,7 @@ async def _download_and_send(
                     send_path,
                     cap,
                     status_update=lambda text: edit_or_replace_status(status, text),
+                    reply_to=message.message_id,
                 )
                 if ok:
                     sent_anything = True
@@ -427,6 +451,7 @@ async def _download_and_send(
                         caption=f"{cap}\n{label}" if (cap and i == 1) else label,
                         supports_streaming=True,
                         parse_mode=None,
+                        reply_parameters=_reply_to(message),
                     )
                     sent_anything = True
                 continue
@@ -436,6 +461,7 @@ async def _download_and_send(
                 caption=cap,
                 supports_streaming=True,
                 parse_mode=None,
+                reply_parameters=_reply_to(message),
             )
             sent_anything = True
 

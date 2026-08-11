@@ -145,11 +145,15 @@ async def send_large_video(
     path: Path,
     caption: str | None,
     status_update: Callable[[str], Awaitable[None]] | None = None,
+    reply_to: int | None = None,
 ) -> bool:
     """Upload a video over MTProto, bypassing the Bot API's ~50 MB limit.
 
-    Sends the file exactly as downloaded (no re-encoding). Returns False on
-    any failure so the caller can fall back to splitting.
+    Sends the file exactly as downloaded (no re-encoding). `reply_to` is the
+    message id carrying the original link, so large videos are threaded under
+    it like every other result; Telegram drops the reply header rather than
+    failing if that message is gone. Returns False on any failure so the
+    caller can fall back to splitting.
     """
     if not settings.mtproto_enabled:
         return False
@@ -182,6 +186,7 @@ async def send_large_video(
             ],
             thumb=str(thumb) if thumb else None,
             progress_callback=_make_progress_callback(status_update, size),
+            reply_to=reply_to,
         )
         logger.info("MTProto upload ok: %s (%d bytes)", path.name, size)
         return True
