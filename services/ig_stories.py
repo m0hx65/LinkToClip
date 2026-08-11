@@ -76,6 +76,10 @@ class StoryItem:
     pk: str
     media_type: str  # "image" or "video"
     url: str  # dl.snapcdn.app download link
+    # Real scontent.cdninstagram.com URL decoded from the snapcdn JWT. Public
+    # and signed, so Telegram's servers can fetch it directly — see
+    # services/downloader.py for why that matters for hosting bandwidth.
+    cdn_url: str | None = None
 
 
 def normalize_story_share_url(url: str) -> str:
@@ -267,6 +271,7 @@ class StoriesClient:
                     pk=pk,
                     media_type="video" if is_video else "image",
                     url=href,
+                    cdn_url=cdn_url,
                 )
             )
         return items
@@ -339,10 +344,14 @@ async def close_client() -> None:
 
 async def _download_items(
     client: StoriesClient, items: list[StoryItem], out_dir: Path, out_stem: str
-) -> list[Path]:
+) -> tuple[list[Path], dict[Path, str]]:
     """Download items concurrently (highlights/carousels can hold dozens); the
     semaphore keeps us polite to the CDN and bounds memory. gather preserves
-    order, so the _<idx> numbering still matches the source sequence."""
+    order, so the _<idx> numbering still matches the source sequence.
+
+    Also returns each downloaded path mapped to its public CDN URL, so callers
+    can offer that URL to Telegram instead of re-uploading the bytes.
+    """
     sem = asyncio.Semaphore(4)
 
     async def _bounded_download(item: StoryItem, dest: Path) -> Path | None:
@@ -354,18 +363,28 @@ async def _download_items(
         ext = ".mp4" if item.media_type == "video" else ".jpg"
         tasks.append(_bounded_download(item, out_dir / f"{out_stem}_{idx}{ext}"))
     results = await asyncio.gather(*tasks)
-    return [p for p in results if p and p.is_file() and p.stat().st_size > 0]
+
+    paths: list[Path] = []
+    sources: dict[Path, str] = {}
+    for item, path in zip(items, results, strict=True):
+        if not (path and path.is_file() and path.stat().st_size > 0):
+            continue
+        paths.append(path)
+        if item.cdn_url:
+            sources[path] = item.cdn_url
+    return paths, sources
 
 
 async def download_story_media(
     url: str, out_dir: Path, out_stem: str
-) -> tuple[list[Path], str | None]:
+) -> tuple[list[Path], str | None, dict[Path, str]]:
     """Download Instagram story/highlight media via saveinsta.to (login-free).
 
     Accepts stories/<username>/, stories/<username>/<pk>/, and
     stories/highlights/<id>/ URLs. When the URL points at one specific story
     and that item is found, only it is downloaded; otherwise all listed items
-    are. Returns ([], None) on any failure so callers can fall back to yt-dlp.
+    are. Returns ([], None, {}) on any failure so callers can fall back to
+    yt-dlp. The third element maps each path to its public CDN URL.
     """
     m_h = _HIGHLIGHT_URL_RE.search(url)
     m_s = _STORY_URL_RE.search(url)
@@ -376,7 +395,7 @@ async def download_story_media(
         target = f"https://www.instagram.com/stories/{m_s.group('username')}/"
         want_pk = m_s.group("pk")
     else:
-        return [], None
+        return [], None, {}
 
     client = get_client()
     items = await client.fetch_items(target)
@@ -385,26 +404,27 @@ async def download_story_media(
         if exact:
             items = exact
 
-    paths = await _download_items(client, items, out_dir, out_stem)
-    return paths, None
+    paths, sources = await _download_items(client, items, out_dir, out_stem)
+    return paths, None, sources
 
 
 async def download_post_media(
     url: str, out_dir: Path, out_stem: str
-) -> tuple[list[Path], str | None]:
+) -> tuple[list[Path], str | None, dict[Path, str]]:
     """Download an Instagram post/reel/carousel via saveinsta.to (login-free).
 
     Works for public content from datacenter IPs where Instagram blocks
-    anonymous yt-dlp requests. Returns ([], None) on any failure so callers
-    can fall back to yt-dlp.
+    anonymous yt-dlp requests. Returns ([], None, {}) on any failure so callers
+    can fall back to yt-dlp. The third element maps each path to its public
+    CDN URL.
     """
     target = canonical_post_url(url)
     if not target:
-        return [], None
+        return [], None, {}
     client = get_client()
     items = await client.fetch_items(target)
-    paths = await _download_items(client, items, out_dir, out_stem)
-    return paths, None
+    paths, sources = await _download_items(client, items, out_dir, out_stem)
+    return paths, None, sources
 
 
 async def resolve_share_url(url: str) -> str:

@@ -43,14 +43,17 @@ flowchart LR
     S -. fallback .-> Y
     TK -. fallback .-> Y
     FX -. fallback .-> Y
-    S & TK & FX & Y --> SZ{"fits 50 MB?"}
-    SZ -- "yes" --> OK[Sent to chat]
+    S & TK & FX & Y --> U{"≤ 20 MB and origin URL known?"}
+    U -- "yes" --> URL["Telegram fetches the URL itself (no upload)"] --> OK[Sent to chat]
+    U -- "no" --> SZ{"fits 50 MB?"}
+    SZ -- "yes" --> OK
     SZ -- "no, API_ID/API_HASH set" --> MT["MTProto upload (whole file, ≤ 2 GB)"] --> OK
     SZ -- "no, no credentials" --> CP["compress (optional) → split into parts"] --> OK
 ```
 
 - **Long polling** — updates arrive via `getUpdates`; no webhook or public URL required.
 - **Health endpoint** — on hosts like Render, a tiny HTTP server answers `GET /` → `ok` so the platform sees the process as healthy.
+- **Bandwidth** — when the media came from a public CDN (Instagram, TikTok, X) and fits the Bot API's URL-send cap of 20 MB (5 MB for photos), the bot passes Telegram the origin URL instead of re-uploading the bytes. Telegram fetches it directly, so the host serves no outbound traffic at all — which matters on metered plans like Render's. Anything larger, plus every yt-dlp result, is uploaded from disk as before; if Telegram declines the URL for any reason the already-downloaded file is uploaded instead, so this is invisible when it doesn't apply.
 - **Performance** — one pooled HTTP session with DNS caching across all downloaders, HLS/DASH fragments fetched 4-wide, carousel/story items downloaded concurrently, and uploads run outside the download queue slot so the next request starts immediately.
 
 ---
@@ -123,6 +126,8 @@ All configuration is via environment variables (or a local `.env` file — see [
 4. Recommended: `TEMP_DIR=/tmp`. Add `COOKIES_FILE` if Instagram posts/reels fail from Render's IPs.
 
 > ⚠️ Run **one** process per `BOT_TOKEN`. A second poller (e.g. a local run alongside the deployed bot) causes `TelegramConflictError`.
+
+> 💸 Render bills **outbound** bandwidth only (5 GB/month free on Hobby, then $0.15/GB) — downloading from Instagram or TikTok is free, sending to Telegram is not. Most clips avoid that charge entirely via the URL-send path described above; what still costs egress is anything over 20 MB, which is uploaded from the host. If a month runs hot, `MTPROTO_MAX_FILE_BYTES` caps the largest single upload.
 
 ### Railway / other hosts
 

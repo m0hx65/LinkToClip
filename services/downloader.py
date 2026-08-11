@@ -5,7 +5,7 @@ import logging
 import re
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -279,6 +279,12 @@ class DownloadResult:
     title: str | None
     direct_urls: list[str]
     platform: Platform
+    # Maps a downloaded file to the public URL it came from, when that URL is
+    # one Telegram's own servers can fetch. The handler offers it to Telegram
+    # instead of uploading the bytes, which costs the host no outbound
+    # bandwidth at all (Render and friends bill egress only). Empty for yt-dlp
+    # results, whose formats are fragmented/expiring and not URL-sendable.
+    source_urls: dict[Path, str] = field(default_factory=dict)
 
 
 def _merge_dict(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
@@ -449,12 +455,14 @@ def _download_sync(url: str, ydl_opts: dict[str, Any]) -> tuple[list[Path], str 
     return existing_paths, title
 
 
-async def _fxtwitter_fallback(url: str, out_dir: Path, out_stem: str) -> tuple[list[Path], str | None]:
+async def _fxtwitter_fallback(
+    url: str, out_dir: Path, out_stem: str
+) -> tuple[list[Path], str | None, dict[Path, str]]:
     """Download all tweet media (videos, photos, GIFs) via the fxtwitter API —
     works from datacenter IPs without auth. Mixed-media tweets are supported."""
     m = _TW_STATUS_RE.match(url.strip())
     if not m:
-        return [], None
+        return [], None, {}
     tweet_id = m.group("id")
     user = m.group("user") or "i"
     api_url = f"https://api.fxtwitter.com/{user}/status/{tweet_id}"
@@ -463,11 +471,11 @@ async def _fxtwitter_fallback(url: str, out_dir: Path, out_stem: str) -> tuple[l
         async with session.get(api_url, timeout=_API_TIMEOUT) as resp:
             if resp.status != 200:
                 logger.info("fxtwitter API %s for tweet %s", resp.status, tweet_id)
-                return [], None
+                return [], None, {}
             data = await resp.json()
     except Exception as e:
         logger.info("fxtwitter fallback error: %s", e)
-        return [], None
+        return [], None, {}
     tw = data.get("tweet") or {}
     title: str | None = tw.get("text") or None
     media = tw.get("media") or {}
@@ -477,14 +485,20 @@ async def _fxtwitter_fallback(url: str, out_dir: Path, out_stem: str) -> tuple[l
     if not isinstance(items, list) or not items:
         items = [*(media.get("videos") or []), *(media.get("photos") or [])]
     tasks = []
+    media_urls: list[str] = []
     for idx, item in enumerate(items, 1):
         if not (isinstance(item, dict) and item.get("url")):
             continue
         # Photos are .jpg; videos and GIFs (which fxtwitter serves as mp4) are .mp4.
         ext = "jpg" if item.get("type") == "photo" else "mp4"
-        tasks.append(_fetch_to_file(str(item["url"]), out_dir / f"{out_stem}_{idx}.{ext}"))
+        media_url = str(item["url"])
+        media_urls.append(media_url)
+        tasks.append(_fetch_to_file(media_url, out_dir / f"{out_stem}_{idx}.{ext}"))
     results = await asyncio.gather(*tasks)
-    return [p for p in results if p], title
+    # video.twimg.com / pbs.twimg.com are public, unauthenticated CDNs, so
+    # Telegram can pull these itself.
+    sources = {p: u for p, u in zip(results, media_urls, strict=True) if p}
+    return [p for p in results if p], title, sources
 
 
 def _tikwm_abs(u: str) -> str:
@@ -492,7 +506,9 @@ def _tikwm_abs(u: str) -> str:
     return "https://www.tikwm.com" + u if u.startswith("/") else u
 
 
-async def _tikwm_download(url: str, out_dir: Path, out_stem: str) -> tuple[list[Path], str | None]:
+async def _tikwm_download(
+    url: str, out_dir: Path, out_stem: str
+) -> tuple[list[Path], str | None, dict[Path, str]]:
     """Download TikTok via tikwm.com API — no auth, no cookies, works from datacenter IPs."""
     try:
         session = _get_http_session()
@@ -503,14 +519,14 @@ async def _tikwm_download(url: str, out_dir: Path, out_stem: str) -> tuple[list[
         ) as resp:
             if resp.status != 200:
                 logger.info("tikwm HTTP %s", resp.status)
-                return [], None
+                return [], None, {}
             data = await resp.json(content_type=None)
     except Exception as e:
         logger.info("tikwm error: %s", e)
-        return [], None
+        return [], None, {}
     if data.get("code") != 0:
         logger.info("tikwm error code=%s msg=%s", data.get("code"), data.get("msg"))
-        return [], None
+        return [], None, {}
     item = data.get("data") or {}
     title: str | None = item.get("title") or None
     headers = {"Referer": "https://www.tikwm.com/"}
@@ -519,31 +535,36 @@ async def _tikwm_download(url: str, out_dir: Path, out_stem: str) -> tuple[list[
     # are only the soundtrack MP3, so download the images instead.
     images = [i for i in (item.get("images") or []) if isinstance(i, str)]
     if images:
+        abs_images = [_tikwm_abs(img) for img in images]
         results = await asyncio.gather(
             *(
-                _fetch_to_file(_tikwm_abs(img), out_dir / f"{out_stem}_{idx}.jpg", headers=headers)
-                for idx, img in enumerate(images, 1)
+                _fetch_to_file(img, out_dir / f"{out_stem}_{idx}.jpg", headers=headers)
+                for idx, img in enumerate(abs_images, 1)
             )
         )
         paths = [p for p in results if p]
+        sources = {p: u for p, u in zip(results, abs_images, strict=True) if p}
         if paths:
             logger.info("tikwm ok photos=%d title=%r", len(paths), title)
-        return paths, title if paths else None
+        return paths, title if paths else None, sources
 
     # Prefer HD play URL, fall back to standard play URL
     video_url: str | None = item.get("hdplay") or item.get("play") or None
     if not video_url:
         logger.info("tikwm no video URL in response")
-        return [], None
+        return [], None, {}
+    abs_video_url = _tikwm_abs(video_url)
     out_path = await _fetch_to_file(
-        _tikwm_abs(video_url),
+        abs_video_url,
         out_dir / f"{out_stem}_1.mp4",
         headers=headers,
     )
     if out_path:
         logger.info("tikwm ok title=%r", title)
-        return [out_path], title
-    return [], None
+        # tikwm's proxy 302s to the TikTok CDN and needs no Referer, so
+        # Telegram can fetch this URL itself.
+        return [out_path], title, {out_path: abs_video_url}
+    return [], None, {}
 
 
 def _is_ig_profile_url(url: str) -> bool:
@@ -586,10 +607,13 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
     # needed for public accounts (Instagram's own endpoints return login_required
     # for story media). Falls back to yt-dlp, which for stories needs cookies.
     if platform is Platform.INSTAGRAM and _IG_STORY_RE.search(url):
-        paths, title = await ig_stories.download_story_media(url, out_dir, out_stem)
+        paths, title, sources = await ig_stories.download_story_media(url, out_dir, out_stem)
         if paths:
             logger.info("saveinsta.to ok files=%d", len(paths))
-            return DownloadResult(path=paths[0], paths=paths, title=title, direct_urls=[], platform=platform)
+            return DownloadResult(
+                path=paths[0], paths=paths, title=title, direct_urls=[],
+                platform=platform, source_urls=sources,
+            )
         logger.info("saveinsta.to returned nothing for %s", url)
         # Without cookies, yt-dlp cannot download stories (login_required) —
         # skip the doomed attempt and give a clear error. Highlights sometimes
@@ -611,10 +635,13 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
     # from datacenter IPs where Instagram blocks cookieless yt-dlp requests.
     # Falls back to yt-dlp, which succeeds with COOKIES_FILE or friendly IPs.
     if platform is Platform.INSTAGRAM and not _IG_STORY_RE.search(url):
-        paths, title = await ig_stories.download_post_media(url, out_dir, out_stem)
+        paths, title, sources = await ig_stories.download_post_media(url, out_dir, out_stem)
         if paths:
             logger.info("saveinsta.to post ok files=%d", len(paths))
-            return DownloadResult(path=paths[0], paths=paths, title=title, direct_urls=[], platform=platform)
+            return DownloadResult(
+                path=paths[0], paths=paths, title=title, direct_urls=[],
+                platform=platform, source_urls=sources,
+            )
         logger.info("saveinsta.to returned nothing for post %s; falling back to yt-dlp", url)
 
     # TikTok: tikwm.com first — no auth, no cookies, bypasses datacenter IP
@@ -622,20 +649,26 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
     # resort, needs cookies on cloud hosts). cobalt.tools was dropped from
     # the chain: its API now rejects all anonymous requests (JWT required).
     if platform is Platform.TIKTOK:
-        paths, title = await _tikwm_download(url, out_dir, out_stem)
+        paths, title, sources = await _tikwm_download(url, out_dir, out_stem)
         if paths:
             logger.info("tikwm TikTok ok files=%d", len(paths))
-            return DownloadResult(path=paths[0], paths=paths, title=title, direct_urls=[], platform=platform)
+            return DownloadResult(
+                path=paths[0], paths=paths, title=title, direct_urls=[],
+                platform=platform, source_urls=sources,
+            )
         logger.info("tikwm TikTok failed; falling back to yt-dlp")
 
     # Twitter: fxtwitter first — instant on cloud IPs, no auth needed, and it
     # returns every attachment (photos, videos, GIFs) of mixed-media tweets.
     # Fall through to yt-dlp only if fxtwitter has nothing (private/deleted tweet).
     if platform is Platform.TWITTER:
-        paths, title = await _fxtwitter_fallback(url, out_dir, out_stem)
+        paths, title, sources = await _fxtwitter_fallback(url, out_dir, out_stem)
         if paths:
             logger.info("fxtwitter ok files=%s", len(paths))
-            return DownloadResult(path=paths[0], paths=paths, title=title, direct_urls=[], platform=platform)
+            return DownloadResult(
+                path=paths[0], paths=paths, title=title, direct_urls=[],
+                platform=platform, source_urls=sources,
+            )
         logger.info("fxtwitter no media; falling back to yt-dlp")
 
 

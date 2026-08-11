@@ -7,6 +7,7 @@ from pathlib import Path
 
 from aiogram import F, Router
 from aiogram.enums import ChatAction
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import FSInputFile, InputMediaPhoto, Message
 
@@ -46,6 +47,33 @@ _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
 def _is_image(path: Path) -> bool:
     return path.suffix.lower() in _IMAGE_EXTS
+
+
+# Handing Telegram a URL makes *its* servers fetch the media, so the file never
+# leaves this host a second time. Hosts bill outbound traffic (Render: 5 GB free,
+# then $0.15/GB), and a relay bot's egress is otherwise equal to everything it
+# sends — so this is the difference between paying per reel and paying nothing.
+# The Bot API caps URL sends at 5 MB for photos and 20 MB for everything else;
+# anything larger still has to be uploaded from disk.
+_URL_SEND_MAX_PHOTO = 5 * 1024 * 1024
+_URL_SEND_MAX_VIDEO = 20 * 1024 * 1024
+
+
+def _sendable_url(path: Path, sources: dict[Path, str], *, is_photo: bool) -> str | None:
+    """The public URL Telegram can fetch instead of us uploading `path`.
+
+    None when the file has no public source (yt-dlp results, compressed or
+    split files) or is over the Bot API's URL-send limit.
+    """
+    url = sources.get(path)
+    if not url:
+        return None
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None
+    limit = _URL_SEND_MAX_PHOTO if is_photo else _URL_SEND_MAX_VIDEO
+    return url if size <= limit else None
 
 
 # Telegram messages can carry many links; cap the work per message so one
@@ -130,6 +158,57 @@ async def on_text(
             await status.delete()
         except Exception:
             logger.debug("Could not delete status message", exc_info=True)
+
+
+# Only TelegramBadRequest means "I did not send this" — it is what Telegram
+# returns when it can't fetch a URL ("failed to get HTTP URL content", "wrong
+# file identifier/HTTP URL specified"). Timeouts and network errors are
+# deliberately NOT caught: TelegramNetworkError subclasses TelegramAPIError,
+# and a timed-out request may well have been delivered, so falling back to an
+# upload there could post the same video twice. Those propagate to the
+# caller's handler exactly as an upload failure always has.
+async def _send_video_by_url(message: Message, url: str, caption: str | None) -> bool:
+    """Ask Telegram to fetch and post the video itself. False if it refused."""
+    try:
+        await message.answer_video(
+            url,
+            caption=caption,
+            supports_streaming=True,
+            parse_mode=None,
+        )
+        return True
+    except TelegramBadRequest as e:
+        logger.info("URL send refused (%s) for %s — uploading instead", e, url[:100])
+        return False
+
+
+async def _send_photo_by_url(message: Message, url: str, caption: str | None) -> bool:
+    try:
+        await message.answer_photo(url, caption=caption, parse_mode=None)
+        return True
+    except TelegramBadRequest as e:
+        logger.info("URL send refused (%s) for %s — uploading instead", e, url[:100])
+        return False
+
+
+async def _send_album_by_url(
+    message: Message, urls: list[str], caption: str | None
+) -> bool:
+    try:
+        await message.answer_media_group(
+            [
+                InputMediaPhoto(
+                    media=u,
+                    caption=(caption if j == 0 else None),
+                    parse_mode=None,
+                )
+                for j, u in enumerate(urls)
+            ]
+        )
+        return True
+    except TelegramBadRequest as e:
+        logger.info("URL album send refused (%s) — uploading %d files", e, len(urls))
+        return False
 
 
 async def _download_and_send(
@@ -256,22 +335,33 @@ async def _download_and_send(
             for chunk_start in range(0, len(photo_paths), 10):
                 chunk = photo_paths[chunk_start:chunk_start + 10]
                 cap = (caption or None) if not caption_used else None
+                urls = [
+                    _sendable_url(p, result.source_urls, is_photo=True) for p in chunk
+                ]
                 if len(chunk) == 1:
-                    await message.answer_photo(
-                        FSInputFile(chunk[0]),
-                        caption=cap,
-                        parse_mode=None,
+                    sent = urls[0] is not None and await _send_photo_by_url(
+                        message, urls[0], cap
                     )
-                else:
-                    media = [
-                        InputMediaPhoto(
-                            media=FSInputFile(p),
-                            caption=(cap if j == 0 else None),
+                    if not sent:
+                        await message.answer_photo(
+                            FSInputFile(chunk[0]),
+                            caption=cap,
                             parse_mode=None,
                         )
-                        for j, p in enumerate(chunk)
-                    ]
-                    await message.answer_media_group(media)
+                else:
+                    # One send_media_group call is all-or-nothing, so retrying
+                    # the whole album from disk cannot duplicate anything.
+                    sent = all(urls) and await _send_album_by_url(message, urls, cap)
+                    if not sent:
+                        media = [
+                            InputMediaPhoto(
+                                media=FSInputFile(p),
+                                caption=(cap if j == 0 else None),
+                                parse_mode=None,
+                            )
+                            for j, p in enumerate(chunk)
+                        ]
+                        await message.answer_media_group(media)
                 caption_used = True
                 sent_anything = True
 
@@ -283,6 +373,14 @@ async def _download_and_send(
                 caption_used = True
             else:
                 cap = part_label
+
+            # Cheapest path first: let Telegram pull the file from its origin.
+            # Compressed and split files are absent from source_urls, so they
+            # skip straight to the upload below.
+            url_candidate = _sendable_url(send_path, result.source_urls, is_photo=False)
+            if url_candidate and await _send_video_by_url(message, url_candidate, cap):
+                sent_anything = True
+                continue
 
             if via_mtproto:
                 ok = await send_large_video(
