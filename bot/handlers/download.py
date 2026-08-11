@@ -9,14 +9,22 @@ from aiogram import F, Router
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
-from aiogram.types import FSInputFile, InputMediaPhoto, Message, ReplyParameters
+from aiogram.types import (
+    FSInputFile,
+    InputMediaPhoto,
+    InputMediaVideo,
+    Message,
+    ReplyParameters,
+)
 
+from services import file_cache
 from services.compressor import compress_video, split_video
 from services.downloader import DownloadError, download_media, get_direct_urls
+from services.file_cache import CachedItem, CachedMedia
 from services.mtproto_sender import send_large_video
 from utils.config import Settings
 from utils.messaging import edit_or_replace_status
-from utils.urltools import normalize_http_url
+from utils.urltools import canonical_media_key, normalize_http_url
 
 logger = logging.getLogger(__name__)
 
@@ -190,10 +198,62 @@ def _reply_to(message: Message) -> ReplyParameters:
     )
 
 
-async def _send_video_by_url(message: Message, url: str, caption: str | None) -> bool:
-    """Ask Telegram to fetch and post the video itself. False if it refused."""
+def _remember(sent: list[CachedItem], posted: Message | list[Message] | None) -> None:
+    """Collect the file_ids Telegram assigned, so a repeat can reuse them."""
+    # A media group returns a list, every other send returns one message.
+    posted_list = posted if isinstance(posted, list) else ([posted] if posted else [])
+    for m in posted_list:
+        if m.video:
+            sent.append(CachedItem(kind="video", file_id=m.video.file_id))
+        elif m.photo:
+            sent.append(CachedItem(kind="photo", file_id=m.photo[-1].file_id))
+
+
+async def _send_cached(message: Message, cached: CachedMedia) -> bool:
+    """Resend media Telegram already holds. No download, no upload, no size cap."""
     try:
-        await message.answer_video(
+        if len(cached.items) == 1:
+            item = cached.items[0]
+            if item.kind == "video":
+                await message.answer_video(
+                    item.file_id,
+                    caption=cached.caption,
+                    supports_streaming=True,
+                    parse_mode=None,
+                    reply_parameters=_reply_to(message),
+                )
+            else:
+                await message.answer_photo(
+                    item.file_id,
+                    caption=cached.caption,
+                    parse_mode=None,
+                    reply_parameters=_reply_to(message),
+                )
+        else:
+            await message.answer_media_group(
+                [
+                    (InputMediaVideo if item.kind == "video" else InputMediaPhoto)(
+                        media=item.file_id,
+                        caption=(cached.caption if j == 0 else None),
+                        parse_mode=None,
+                    )
+                    for j, item in enumerate(cached.items)
+                ],
+                reply_parameters=_reply_to(message),
+            )
+        logger.info("Sent from cache: %d file(s), nothing downloaded or uploaded", len(cached.items))
+        return True
+    except TelegramBadRequest as e:
+        logger.info("Cached file_id rejected (%s) — falling back to a fresh download", e)
+        return False
+
+
+async def _send_video_by_url(
+    message: Message, url: str, caption: str | None
+) -> Message | None:
+    """Ask Telegram to fetch and post the video itself. None if it refused."""
+    try:
+        posted = await message.answer_video(
             url,
             caption=caption,
             supports_streaming=True,
@@ -201,32 +261,34 @@ async def _send_video_by_url(message: Message, url: str, caption: str | None) ->
             reply_parameters=_reply_to(message),
         )
         logger.info("Sent by URL, no upload: %s", url[:100])
-        return True
+        return posted
     except TelegramBadRequest as e:
         logger.info("URL send refused (%s) for %s — uploading instead", e, url[:100])
-        return False
+        return None
 
 
-async def _send_photo_by_url(message: Message, url: str, caption: str | None) -> bool:
+async def _send_photo_by_url(
+    message: Message, url: str, caption: str | None
+) -> Message | None:
     try:
-        await message.answer_photo(
+        posted = await message.answer_photo(
             url,
             caption=caption,
             parse_mode=None,
             reply_parameters=_reply_to(message),
         )
         logger.info("Sent by URL, no upload: %s", url[:100])
-        return True
+        return posted
     except TelegramBadRequest as e:
         logger.info("URL send refused (%s) for %s — uploading instead", e, url[:100])
-        return False
+        return None
 
 
 async def _send_album_by_url(
     message: Message, urls: list[str], caption: str | None
-) -> bool:
+) -> list[Message] | None:
     try:
-        await message.answer_media_group(
+        posted = await message.answer_media_group(
             [
                 InputMediaPhoto(
                     media=u,
@@ -238,10 +300,10 @@ async def _send_album_by_url(
             reply_parameters=_reply_to(message),
         )
         logger.info("Sent album by URL, no upload: %d photos", len(urls))
-        return True
+        return posted
     except TelegramBadRequest as e:
         logger.info("URL album send refused (%s) — uploading %d files", e, len(urls))
-        return False
+        return None
 
 
 async def _download_and_send(
@@ -259,6 +321,22 @@ async def _download_and_send(
     work_paths: list[Path] = []
     compressed_paths: list[Path] = []
     part_paths: list[Path] = []
+
+    # A link we have already served needs no resolver call, no download and no
+    # upload — Telegram still holds the file. Checked before the queue so a
+    # repeat stays instant even while another download is running.
+    cache_key = canonical_media_key(url)
+    cached = file_cache.get(cache_key)
+    if cached is not None:
+        if await _send_cached(message, cached):
+            return None
+        file_cache.drop(cache_key)
+
+    # file_ids worth remembering, and whether this link produced a set we can
+    # replay wholesale. Split parts and MTProto uploads don't yield usable
+    # Bot API file_ids, so those links stay uncached.
+    sent_media: list[CachedItem] = []
+    cacheable = True
 
     try:
         if semaphore.locked():
@@ -372,11 +450,13 @@ async def _download_and_send(
                     _sendable_url(p, result.source_urls, is_photo=True) for p in chunk
                 ]
                 if len(chunk) == 1:
-                    sent = urls[0] is not None and await _send_photo_by_url(
-                        message, urls[0], cap
+                    posted = (
+                        await _send_photo_by_url(message, urls[0], cap)
+                        if urls[0] is not None
+                        else None
                     )
-                    if not sent:
-                        await message.answer_photo(
+                    if posted is None:
+                        posted = await message.answer_photo(
                             FSInputFile(chunk[0]),
                             caption=cap,
                             parse_mode=None,
@@ -385,8 +465,12 @@ async def _download_and_send(
                 else:
                     # One send_media_group call is all-or-nothing, so retrying
                     # the whole album from disk cannot duplicate anything.
-                    sent = all(urls) and await _send_album_by_url(message, urls, cap)
-                    if not sent:
+                    posted = (
+                        await _send_album_by_url(message, urls, cap)
+                        if all(urls)
+                        else None
+                    )
+                    if posted is None:
                         media = [
                             InputMediaPhoto(
                                 media=FSInputFile(p),
@@ -395,9 +479,10 @@ async def _download_and_send(
                             )
                             for j, p in enumerate(chunk)
                         ]
-                        await message.answer_media_group(
+                        posted = await message.answer_media_group(
                             media, reply_parameters=_reply_to(message)
                         )
+                _remember(sent_media, posted)
                 caption_used = True
                 sent_anything = True
 
@@ -414,11 +499,17 @@ async def _download_and_send(
             # Compressed and split files are absent from source_urls, so they
             # skip straight to the upload below.
             url_candidate = _sendable_url(send_path, result.source_urls, is_photo=False)
-            if url_candidate and await _send_video_by_url(message, url_candidate, cap):
-                sent_anything = True
-                continue
+            if url_candidate:
+                posted = await _send_video_by_url(message, url_candidate, cap)
+                if posted is not None:
+                    _remember(sent_media, posted)
+                    sent_anything = True
+                    continue
 
             if via_mtproto:
+                # Telethon uploads don't hand back a Bot API file_id, so this
+                # link can't be replayed from cache later.
+                cacheable = False
                 ok = await send_large_video(
                     settings,
                     message.chat.id,
@@ -443,6 +534,7 @@ async def _download_and_send(
                     logger.warning("Split failed for %s", send_path)
                     continue
                 part_paths.extend(parts)
+                cacheable = False  # parts of one video, not a replayable set
                 n = len(parts)
                 for i, p in enumerate(parts, 1):
                     label = f"Part {i}/{n}"
@@ -456,16 +548,19 @@ async def _download_and_send(
                     sent_anything = True
                 continue
 
-            await message.answer_video(
+            posted = await message.answer_video(
                 FSInputFile(send_path),
                 caption=cap,
                 supports_streaming=True,
                 parse_mode=None,
                 reply_parameters=_reply_to(message),
             )
+            _remember(sent_media, posted)
             sent_anything = True
 
         if sent_anything:
+            if cacheable and sent_media:
+                file_cache.put(cache_key, sent_media, caption or None)
             return None
         direct_urls = await get_direct_urls(url, settings)
         lines = ["Could not send the file (splitting failed). Download links:"]

@@ -43,6 +43,9 @@ flowchart LR
     S -. fallback .-> Y
     TK -. fallback .-> Y
     FX -. fallback .-> Y
+    A --> C{"sent before?"}
+    C -- "yes" --> FID["resend by file_id (no download, no upload)"] --> OK
+    C -- "no" --> B
     S & TK & FX & Y --> U{"≤ 20 MB and origin URL known?"}
     U -- "yes" --> URL["Telegram fetches the URL itself (no upload)"] --> OK[Sent to chat]
     U -- "no" --> SZ{"fits 50 MB?"}
@@ -53,6 +56,7 @@ flowchart LR
 
 - **Long polling** — updates arrive via `getUpdates`; no webhook or public URL required.
 - **Health endpoint** — on hosts like Render, a tiny HTTP server answers `GET /` → `ok` so the platform sees the process as healthy.
+- **Repeat links** — an in-memory cache maps each link to the `file_id` Telegram assigned, so sending the same link again re-delivers it with no resolver call, no download and no upload, at any size. Keys ignore per-share tracking parameters (`?igsh=`, `?t=`), so the same reel shared by two people is one entry. The cache is cleared by a restart or an idle spin-down, and links delivered as split parts or MTProto uploads aren't cached (no Bot API `file_id` comes back from those).
 - **Bandwidth** — when the media came from a public CDN (Instagram, TikTok, X) and fits the Bot API's URL-send cap of 20 MB (5 MB for photos), the bot passes Telegram the origin URL instead of re-uploading the bytes. Telegram fetches it directly, so the host serves no outbound traffic at all — which matters on metered plans like Render's. Anything larger, plus every yt-dlp result, is uploaded from disk as before; if Telegram declines the URL for any reason the already-downloaded file is uploaded instead, so this is invisible when it doesn't apply.
 - **Performance** — one pooled HTTP session with DNS caching across all downloaders, HLS/DASH fragments fetched 4-wide, carousel/story items downloaded concurrently, and uploads run outside the download queue slot so the next request starts immediately.
 
