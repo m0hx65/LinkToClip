@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message
 
 TG_MAX = 4000
@@ -15,6 +16,12 @@ async def edit_or_replace_status(status: Message, text: str) -> None:
     parts = chunk_text(text)
     try:
         await status.edit_text(parts[0], parse_mode=None)
+    except TelegramBadRequest as e:
+        # The message already shows this text — nothing to do. Posting it
+        # again would leave a duplicate status message that never updates.
+        if "message is not modified" in str(e):
+            return
+        await status.answer(parts[0], parse_mode=None)
     except Exception:
         await status.answer(parts[0], parse_mode=None)
     for extra in parts[1:]:

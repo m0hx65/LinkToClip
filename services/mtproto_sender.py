@@ -125,15 +125,20 @@ def _make_progress_callback(
         return None
     loop = asyncio.get_running_loop()
     total_mb = max(total_bytes // (1024 * 1024), 1)
-    last_edit = 0.0
+    # The caller has just shown "... 0%"; start the clock there so the first
+    # chunk doesn't immediately re-send that same text.
+    last_edit = time.monotonic()
+    last_pct = 0
 
     def callback(sent: int, _total: int) -> None:
-        nonlocal last_edit
+        nonlocal last_edit, last_pct
         now = time.monotonic()
         if now - last_edit < 10:
             return
-        last_edit = now
         pct = min(int(sent * 100 / max(total_bytes, 1)), 100)
+        if pct == last_pct:
+            return
+        last_edit, last_pct = now, pct
         loop.create_task(status_update(f"Uploading {total_mb} MB... {pct}%"))
 
     return callback
