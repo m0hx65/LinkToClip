@@ -37,7 +37,7 @@ Each platform routes through its fastest source first and degrades gracefully to
 flowchart LR
     A[Link received] --> B{Platform?}
     B -- "Instagram (all types)" --> S["saveinsta.to (anonymous)"]
-    B -- "TikTok" --> TK[tikwm.com]
+    B -- "TikTok" --> TK["TikTok embed player → tikwm.com"]
     B -- "X / Twitter" --> FX[fxtwitter API]
     B -- "YouTube" --> Y[yt-dlp]
     S -. fallback .-> Y
@@ -155,7 +155,7 @@ Same recipe: provide `BOT_TOKEN`, prefer the Docker image (ffmpeg included), and
 | Exit code **137** / "Killed" | Out of memory | Keep concurrency at 1, disable compression, or upsize the instance. |
 | Instagram posts always fail on the server | saveinsta.to hiccup or private account | Public content needs no cookies — retry in a minute. Private accounts always need `COOKIES_FILE`; also verify `TEMP_DIR` is writable. |
 | "No video could be found" (X) | Text-only tweet, or fxtwitter is down | Photo tweets normally work via fxtwitter; if it's down, only videos are recoverable through yt-dlp. |
-| TikTok fails without cookies | Both sources blocked | Rare; set `TIKTOK_COOKIES_FILE` as a last resort. |
+| TikTok fails without cookies | Embed player, tikwm.com and yt-dlp all blocked | Rare; set `TIKTOK_COOKIES_FILE` as a last resort. |
 | `TelegramConflictError` on startup | Two pollers on one token | Stop the duplicate process (local run vs. deployed instance). |
 | Video plays on Android but not iPhone | Codec | Format selection already prefers H.264 MP4 — report the URL as a bug. |
 

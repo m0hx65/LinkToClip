@@ -27,6 +27,9 @@ _IG_STORY_RE = re.compile(r"instagram\.com/stories/", re.I)
 # Used to give a clear "not downloadable" error before wasting a download attempt.
 _IG_PROFILE_RE = re.compile(r"instagram\.com/([^/?#]+)/?(?:\?|#|$)", re.I)
 _IG_CONTENT_PATH_RE = re.compile(r"instagram\.com/(?:p|reel|tv|stories|reels|share)/", re.I)
+# Video posts only: /photo/ links deliberately don't match, so photo-mode
+# posts skip the embed-player path and go straight to tikwm/yt-dlp.
+_TT_VIDEO_ID_RE = re.compile(r"tiktok\.com/(?:@[^/?#]*/video|v)/(\d+)", re.I)
 _TW_STATUS_RE = re.compile(
     r"^(?:https?://)?(?:www\.)?(?:x\.com|twitter\.com)/(?:i/(?:web/)?status|(?P<user>[^/?#]+)/status)/(?P<id>\d+)(?:[/?#].*)?$",
     re.I,
@@ -262,6 +265,19 @@ def _map_download_failure(platform: Platform, err: Exception, settings: Settings
                 "TIKTOK_COOKIES_FILE (or COOKIES_FILE) in your environment to bypass this.",
                 retryable=False,
             ) from err
+        if "/photo/" in url.lower():
+            raise DownloadError(
+                "Could not download this TikTok photo post. Photo posts come only from "
+                "tikwm.com, which returned nothing — it may be down or blocking this "
+                "server, or the post is private.",
+                retryable=False,
+            ) from err
+        raise DownloadError(
+            "Could not download this TikTok. TikTok's player, tikwm.com, and the direct "
+            "fetch all failed — the post may be private or region-locked, or TikTok is "
+            "rate-limiting this server. This usually resolves on retry.",
+            retryable=True,
+        ) from err
 
     if "private" in msg or "login" in msg or "cookies" in msg:
         raise DownloadError(
@@ -567,6 +583,86 @@ async def _tikwm_download(
     return [], None, {}
 
 
+async def _resolve_tiktok_url(url: str) -> str:
+    """Share links (vm./vt.tiktok.com/…, tiktok.com/t/…) carry no video id;
+    follow their redirect to the canonical /@user/video/<id> URL."""
+    if _TT_VIDEO_ID_RE.search(url):
+        return url
+    try:
+        async with _get_http_session().get(url, timeout=_API_TIMEOUT) as resp:
+            return str(resp.url)
+    except Exception as e:
+        logger.info("tiktok share link resolve error: %s", e)
+        return url
+
+
+def _tiktok_play_urls(video_info: dict[str, Any]) -> list[str]:
+    """Play URLs best-first: H.264 before H.265 (iOS needs H.264), higher
+    bitrate first, then the bare url_list some posts carry instead of profiles."""
+    profiles = sorted(
+        (p for p in video_info.get("profiles") or [] if isinstance(p, dict)),
+        key=lambda p: (p.get("codec_type") != "h264", -(p.get("bitrate") or 0)),
+    )
+    urls = [u for p in profiles for u in (p.get("play_addr") or {}).get("url_list") or []]
+    urls += video_info.get("url_list") or []
+    return list(dict.fromkeys(u for u in urls if isinstance(u, str)))
+
+
+async def _tiktok_player_download(
+    url: str, out_dir: Path, out_stem: str
+) -> tuple[list[Path], str | None, dict[Path, str]]:
+    """Download a TikTok video via the API behind TikTok's own embed player.
+
+    The player is built for third-party sites, so it answers plain requests
+    without the bot challenge the main web page serves, and some of each
+    video's play URLs need no cookies or Referer.
+    """
+    m = _TT_VIDEO_ID_RE.search(await _resolve_tiktok_url(url))
+    if not m:
+        logger.info("tiktok player: no video id (photo post or unresolved link)")
+        return [], None, {}
+    try:
+        async with _get_http_session().get(
+            "https://www.tiktok.com/player/api/v1/items",
+            params={"item_ids": m.group(1)},
+            timeout=_API_TIMEOUT,
+        ) as resp:
+            if resp.status != 200:
+                logger.info("tiktok player HTTP %s", resp.status)
+                return [], None, {}
+            data = await resp.json(content_type=None)
+    except Exception as e:
+        logger.info("tiktok player error: %s", e)
+        return [], None, {}
+    items = data.get("items") or []
+    if not items:
+        logger.info(
+            "tiktok player no item status=%s msg=%s", data.get("status_code"), data.get("status_msg")
+        )
+        return [], None, {}
+    item = items[0]
+    # aweme_type 150 is a photo-mode post; its media is slides plus a
+    # soundtrack, which tikwm/yt-dlp handle.
+    if item.get("aweme_type") == 150 or item.get("image_post_info"):
+        logger.info("tiktok player: photo post, skipping")
+        return [], None, {}
+    title: str | None = item.get("desc") or None
+    play_urls = _tiktok_play_urls(item.get("video_info") or {})
+    # First pass without a Referer: a URL that works bare is one Telegram can
+    # fetch itself. Some CDN hosts (v16-webapp-prime) insist on a tiktok.com
+    # Referer, so retry with one — that file is uploaded, not sent by URL.
+    for headers in (None, {"Referer": "https://www.tiktok.com/"}):
+        for video_url in play_urls:
+            out_path = await _fetch_to_file(
+                video_url, out_dir / f"{out_stem}_1.mp4", headers=headers
+            )
+            if out_path:
+                logger.info("tiktok player ok referer=%s title=%r", bool(headers), title)
+                return [out_path], title, ({} if headers else {out_path: video_url})
+    logger.info("tiktok player: no play URL downloaded")
+    return [], None, {}
+
+
 def _is_ig_profile_url(url: str) -> bool:
     """Return True if url is a bare Instagram profile link with no downloadable content path."""
     return bool(_IG_PROFILE_RE.search(url) and not _IG_CONTENT_PATH_RE.search(url))
@@ -644,19 +740,26 @@ async def download_media(url: str, settings: Settings) -> DownloadResult:
             )
         logger.info("saveinsta.to returned nothing for post %s; falling back to yt-dlp", url)
 
-    # TikTok: tikwm.com first — no auth, no cookies, bypasses datacenter IP
-    # blocking, and handles photo-mode posts. Falls back to yt-dlp (last
-    # resort, needs cookies on cloud hosts). cobalt.tools was dropped from
-    # the chain: its API now rejects all anonymous requests (JWT required).
+    # TikTok: TikTok's own embed-player API first — no auth, no cookies, and
+    # no bot challenge (the web page yt-dlp scrapes now serves one). tikwm.com
+    # next: it covers photo-mode posts, but has sat behind a Cloudflare
+    # challenge since 2026-10 that rejects every server request. yt-dlp is
+    # the last resort (needs curl_cffi impersonation, cookies on cloud hosts).
+    # cobalt.tools was dropped from the chain: its API now requires a JWT.
     if platform is Platform.TIKTOK:
-        paths, title, sources = await _tikwm_download(url, out_dir, out_stem)
-        if paths:
-            logger.info("tikwm TikTok ok files=%d", len(paths))
-            return DownloadResult(
-                path=paths[0], paths=paths, title=title, direct_urls=[],
-                platform=platform, source_urls=sources,
-            )
-        logger.info("tikwm TikTok failed; falling back to yt-dlp")
+        for source, fetch in (
+            ("tiktok player", _tiktok_player_download),
+            ("tikwm", _tikwm_download),
+        ):
+            paths, title, sources = await fetch(url, out_dir, out_stem)
+            if paths:
+                logger.info("%s TikTok ok files=%d", source, len(paths))
+                return DownloadResult(
+                    path=paths[0], paths=paths, title=title, direct_urls=[],
+                    platform=platform, source_urls=sources,
+                )
+            logger.info("%s TikTok failed", source)
+        logger.info("Falling back to yt-dlp for TikTok")
 
     # Twitter: fxtwitter first — instant on cloud IPs, no auth needed, and it
     # returns every attachment (photos, videos, GIFs) of mixed-media tweets.
